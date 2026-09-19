@@ -247,6 +247,14 @@ def test_slow_tool_call_does_not_block_the_server():
         server._write = original
 
 
+def test_non_ascii_results_survive_the_stdio_pipe():
+    # On Windows a piped stdout defaults to cp1252: a delegate's "→" killed the answering thread and the caller hung.
+    request = b'{"jsonrpc": "2.0", "id": 1, "method": "\\u2192"}\n'
+    done = subprocess.run([sys.executable, str(Path(server.__file__))], input=request, capture_output=True, timeout=20)
+    reply = json.loads(done.stdout.decode("utf-8"))
+    assert reply["id"] == 1 and "→" in reply["error"]["message"], done.stderr.decode("utf-8", "replace")
+
+
 def test_tools_list_exposes_the_new_arguments_and_task_tools():
     tools = {t["name"]: t for t in server.TOOLS}
     assert {"ask_codex", "ask_claude", "ask_kiro", "ask_gemini", "ask_opencode", "check_task", "cancel_task", "list_shared_skills"} <= set(tools)

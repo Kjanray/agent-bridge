@@ -555,6 +555,9 @@ def _handle(message: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    # MCP stdio is UTF-8; a Windows pipe defaults to cp1252, where a delegate's "→" kills the reply and the caller hangs.
+    for stream in (sys.stdin, sys.stdout):
+        stream.reconfigure(encoding="utf-8")
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
         if not raw_line:
