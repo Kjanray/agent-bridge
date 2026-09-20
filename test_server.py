@@ -387,6 +387,50 @@ def test_auto_modes_map_to_native_cli_flags():
     assert "--auto" in opencode
 
 
+def test_gemini_auto_mode_trusts_the_headless_workspace():
+    task = {
+        "task_id": "gemauto",
+        "target": "gemini",
+        "status": "running",
+        "mode": "auto",
+        "session_id": None,
+        "worktree": None,
+        "branch": None,
+        "files_changed": None,
+        "duration_s": 0.0,
+        "output": "",
+        "output_truncated": False,
+        "transcript": None,
+        "stderr_transcript": None,
+        "transcript_bytes": 0,
+        "_cancelled": False,
+        "_proc": None,
+    }
+    original_popen = subprocess.Popen
+    seen = {}
+
+    class FakeProc:
+        pid = 1
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            return None
+
+    def fake_popen(*args, **kwargs):
+        seen.update(kwargs["env"])
+        return FakeProc()
+
+    subprocess.Popen = fake_popen
+    original_read = server._read_bounded
+    server._read_bounded = lambda path: ("{}", False, 2)
+    try:
+        server._execute(task, "x", None, False, 1)
+    finally:
+        subprocess.Popen = original_popen
+        server._read_bounded = original_read
+    assert seen["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
+
+
 def test_list_auto_modes_describes_every_delegate():
     modes = json.loads(server.list_auto_modes())
     assert set(modes) == {"codex", "claude", "kiro", "gemini", "opencode"}

@@ -498,11 +498,14 @@ def _execute(task: dict[str, Any], prompt: str, skill: str | None, worktree: boo
         stderr_path = TRANSCRIPT_DIR / f"{task['task_id']}.stderr.log"
         task["transcript"] = str(stdout_path)
         task["stderr_transcript"] = str(stderr_path)
+        child_env = _child_env(target.label)
+        if task["target"] == "gemini" and task["mode"] == "auto":
+            child_env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
         with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
             proc = subprocess.Popen(
                 command,
                 cwd=cwd,
-                env=_child_env(target.label),
+                env=child_env,
                 stdin=subprocess.PIPE if target.stdin else subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
