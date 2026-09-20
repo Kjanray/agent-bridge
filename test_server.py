@@ -26,7 +26,10 @@ if "--sleep" in args:
 if "--write" in args:
     pathlib.Path(args[args.index("--write") + 1]).write_text("x")
 if "--fail" in args:
-    sys.stderr.write("boom")
+    message = args[args.index("--error-text") + 1] if "--error-text" in args else "boom"
+    if "--stdout-before-fail" in args:
+        print(json.dumps({"result": "real structured failure"}))
+    sys.stderr.write(message)
     sys.exit(3)
 print(json.dumps({"session_id": "sess-1", "result": f"args={args} prompt={prompt}"}))
 """,
@@ -40,6 +43,7 @@ for cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "init"]):
     )
 server.ROOT = REPO
 server.LOG_PATH = TMP / "calls.jsonl"
+server.TRANSCRIPT_DIR = TMP / "transcripts"
 
 
 def fake(*extra: str, max_parallel: int = 3) -> str:
@@ -135,6 +139,13 @@ def test_cli_failure_is_status_error_with_stderr():
     assert "boom" in result["output"]
 
 
+def test_cli_failure_prefers_parsed_stdout_over_stderr_noise():
+    result = server.delegate(fake("--fail", "--stdout-before-fail", "--error-text", "harmless transport warning"), "x")
+    assert result["status"] == "error", result
+    assert "real structured failure" in result["output"]
+    assert "harmless transport warning" not in result["output"]
+
+
 def test_timeout_kills_the_process():
     started = time.monotonic()
     result = server.delegate(fake("--sleep", "30"), "x", timeout_s=1)
@@ -151,6 +162,50 @@ def test_background_returns_immediately_then_check_task_gets_result():
     assert done["status"] == "ok" and "bg" in done["output"], done
 
 
+def test_mcp_call_defaults_to_background():
+    target = fake("--sleep", "1")
+    tool = "ask_test_background_default"
+    server.TOOL_TARGETS[tool] = target
+    try:
+        started = time.monotonic()
+        first = server._call_tool(tool, {"prompt": "bg"})
+        assert first["status"] == "running", first
+        assert time.monotonic() - started < 0.9
+        assert server.check_task(first["task_id"], wait_s=5)["status"] == "ok"
+    finally:
+        server.TOOL_TARGETS.pop(tool, None)
+
+
+def test_explicit_mcp_foreground_call_is_hard_capped():
+    target = fake("--sleep", "3")
+    tool = "ask_test_foreground_cap"
+    server.TOOL_TARGETS[tool] = target
+    previous = server.MCP_FOREGROUND_MAX_SECONDS
+    server.MCP_FOREGROUND_MAX_SECONDS = 0.2
+    try:
+        started = time.monotonic()
+        result = server._call_tool(tool, {"prompt": "x", "background": False, "timeout_s": 30})
+        assert result["status"] == "timeout", result
+        assert time.monotonic() - started < 5
+    finally:
+        server.MCP_FOREGROUND_MAX_SECONDS = previous
+        server.TOOL_TARGETS.pop(tool, None)
+
+
+def test_check_task_wait_is_hard_capped():
+    previous = server.CHECK_TASK_MAX_WAIT_SECONDS
+    server.CHECK_TASK_MAX_WAIT_SECONDS = 0.2
+    first = server.delegate(fake("--sleep", "3"), "x", background=True)
+    try:
+        started = time.monotonic()
+        result = server.check_task(first["task_id"], wait_s=30)
+        assert result["status"] == "running", result
+        assert time.monotonic() - started < 1
+    finally:
+        server.CHECK_TASK_MAX_WAIT_SECONDS = previous
+        server.cancel_task(first["task_id"])
+
+
 def test_cancel_task_stops_a_running_task():
     first = server.delegate(fake("--sleep", "30"), "x", background=True)
     time.sleep(0.5)
@@ -158,6 +213,21 @@ def test_cancel_task_stops_a_running_task():
     assert server.cancel_task(first["task_id"])["status"] == "cancelled"
     assert server.check_task(first["task_id"], wait_s=10)["status"] == "cancelled"
     assert time.monotonic() - started < 10
+
+
+def test_disconnect_cleanup_cancels_running_and_queued_tasks():
+    target = fake("--sleep", "30", max_parallel=1)
+    first = server.delegate(target, "running", background=True)
+    second = server.delegate(target, "queued", background=True)
+    deadline = time.monotonic() + 5
+    while server.TASKS[first["task_id"]]["_proc"] is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    server._cancel_active_tasks()
+
+    assert server.check_task(first["task_id"], wait_s=10)["status"] == "cancelled"
+    assert server.check_task(second["task_id"], wait_s=10)["status"] == "cancelled"
+    assert server.TASKS[second["task_id"]]["_proc"] is None
 
 
 def test_check_task_unknown_id_is_error():
@@ -238,11 +308,12 @@ def test_slow_tool_call_does_not_block_the_server():
         server._handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "ask_slow", "arguments": {"prompt": "x"}}})
         server._handle({"jsonrpc": "2.0", "id": 2, "method": "ping"})
         assert [m["id"] for m in written] == [2], written
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 5
         while len(written) < 2 and time.monotonic() < deadline:
             time.sleep(0.05)
         body = json.loads(written[1]["result"]["content"][0]["text"])
-        assert written[1]["id"] == 1 and body["status"] == "ok"
+        assert written[1]["id"] == 1 and body["status"] == "running"
+        assert server.check_task(body["task_id"], wait_s=5)["status"] == "ok"
     finally:
         server._write = original
 
@@ -260,11 +331,21 @@ def test_tools_list_exposes_the_new_arguments_and_task_tools():
     assert {"ask_codex", "ask_claude", "ask_kiro", "ask_gemini", "ask_opencode", "check_task", "cancel_task", "list_shared_skills"} <= set(tools)
     props = tools["ask_codex"]["inputSchema"]["properties"]
     assert {"prompt", "skill", "session_id", "mode", "background", "worktree", "timeout_s"} <= set(props)
+    assert props["background"]["default"] is True
+    assert props["background"]["const"] is True
+    assert props["prompt"]["maxLength"] == server.CODEX_MAX_PROMPT_CHARS
+    wait_schema = tools["check_task"]["inputSchema"]["properties"]["wait_s"]
+    assert wait_schema["maximum"] == 60
 
 
 def test_codex_command_maps_mode_and_resume():
     build = server.TARGETS["codex"].build
-    assert 'sandbox_mode="read-only"' in build("p", "read_only", None)
+    command = build("p", "read_only", None)
+    assert 'sandbox_mode="read-only"' in command
+    assert command[command.index("-m") + 1] == server.CODEX_MODEL == "chatgpt-web/high"
+    assert "features.multi_agent=false" in command
+    assert "features.multi_agent_v2=false" in command
+    assert "features.unbounded_connection_retries=false" in command
     assert 'sandbox_mode="workspace-write"' in build("p", "write", None)
     resumed = build("p", "read_only", "abc")
     assert resumed[:3] == ["codex", "exec", "resume"] and "abc" in resumed and resumed[-1] == "-"
@@ -289,6 +370,119 @@ def test_parsers_extract_output_and_session_id():
     assert server._parse_gemini('{"session_id": "g-1", "response": "PONG"}') == ("PONG", "g-1")
     assert server._parse_claude('{"session_id": "c-1", "result": "PONG"}') == ("PONG", "c-1")
     assert server._parse_claude("not json") == ("not json", None)
+
+
+def test_bounded_transcript_reader_keeps_head_and_tail():
+    path = TMP / "large.log"
+    path.write_text("HEAD" + ("x" * 10000) + "TAIL", encoding="utf-8")
+    previous = server.MAX_PARSE_BYTES
+    server.MAX_PARSE_BYTES = 1024
+    try:
+        text, truncated, size = server._read_bounded(path)
+    finally:
+        server.MAX_PARSE_BYTES = previous
+    assert truncated is True
+    assert size > len(text)
+    assert text.startswith("HEAD") and text.endswith("TAIL")
+    assert "transcript truncated for parsing" in text
+
+
+def test_codex_call_is_forced_into_background():
+    original_target = server.TARGETS["codex"]
+    original_slot = server._SLOTS.pop("codex", None)
+    original_health = dict(server._CODEX_HEALTH)
+    server.TARGETS["codex"] = server.Target(
+        label="Fake Codex",
+        build=lambda prompt, mode, session_id: [sys.executable, str(FAKE), "--sleep", "1"],
+        parse=server._parse_claude,
+        max_parallel=1,
+    )
+    server._CODEX_HEALTH.update(failures=0, last_failure=0.0, blocked_until=0.0, reason="")
+    try:
+        started = time.monotonic()
+        first = server.delegate("codex", "x", background=False)
+        assert first["status"] == "running", first
+        assert time.monotonic() - started < 0.9
+        assert server.check_task(first["task_id"], wait_s=5)["status"] == "ok"
+    finally:
+        server.TARGETS["codex"] = original_target
+        server._SLOTS.pop("codex", None)
+        if original_slot is not None:
+            server._SLOTS["codex"] = original_slot
+        server._CODEX_HEALTH.clear()
+        server._CODEX_HEALTH.update(original_health)
+
+
+def test_codex_prompt_limit_is_enforced_before_process_start():
+    previous = server.CODEX_MAX_PROMPT_CHARS
+    original_health = dict(server._CODEX_HEALTH)
+    server.CODEX_MAX_PROMPT_CHARS = 5
+    server._CODEX_HEALTH.update(failures=0, last_failure=0.0, blocked_until=0.0, reason="")
+    try:
+        try:
+            server.delegate("codex", "123456", background=True)
+        except RuntimeError as exc:
+            assert "limit" in str(exc) and "file" in str(exc)
+        else:
+            raise AssertionError("oversized Codex prompt was admitted")
+    finally:
+        server.CODEX_MAX_PROMPT_CHARS = previous
+        server._CODEX_HEALTH.clear()
+        server._CODEX_HEALTH.update(original_health)
+
+
+def test_codex_outstanding_capacity_is_enforced_atomically():
+    original_target = server.TARGETS["codex"]
+    original_slot = server._SLOTS.pop("codex", None)
+    original_limit = server.CODEX_MAX_OUTSTANDING
+    original_health = dict(server._CODEX_HEALTH)
+    server.TARGETS["codex"] = server.Target(
+        label="Fake Codex",
+        build=lambda prompt, mode, session_id: [sys.executable, str(FAKE), "--sleep", "30"],
+        parse=server._parse_claude,
+        max_parallel=1,
+    )
+    server.CODEX_MAX_OUTSTANDING = 2
+    server._CODEX_HEALTH.update(failures=0, last_failure=0.0, blocked_until=0.0, reason="")
+    tasks = []
+    try:
+        tasks = [server.delegate("codex", "x", background=True) for _ in range(2)]
+        try:
+            server.delegate("codex", "x", background=True)
+        except RuntimeError as exc:
+            assert "capacity is full" in str(exc)
+        else:
+            raise AssertionError("third Codex task was admitted")
+    finally:
+        for task in tasks:
+            server.cancel_task(task["task_id"])
+        for task in tasks:
+            server.TASKS[task["task_id"]]["_thread"].join(timeout=5)
+        server.TARGETS["codex"] = original_target
+        server.CODEX_MAX_OUTSTANDING = original_limit
+        server._SLOTS.pop("codex", None)
+        if original_slot is not None:
+            server._SLOTS["codex"] = original_slot
+        server._CODEX_HEALTH.clear()
+        server._CODEX_HEALTH.update(original_health)
+
+
+def test_codex_browser_failure_opens_circuit():
+    original_health = dict(server._CODEX_HEALTH)
+    server._CODEX_HEALTH.update(failures=0, last_failure=0.0, blocked_until=0.0, reason="")
+    try:
+        server._record_codex_health(
+            {"target": "codex", "status": "error", "output": "ChatGPT browser stage timed out: send_prompt"}
+        )
+        try:
+            server.delegate("codex", "x", background=True)
+        except RuntimeError as exc:
+            assert "circuit is open" in str(exc) and "browser stage timed out" in str(exc)
+        else:
+            raise AssertionError("Codex task was admitted while the circuit was open")
+    finally:
+        server._CODEX_HEALTH.clear()
+        server._CODEX_HEALTH.update(original_health)
 
 
 if __name__ == "__main__":

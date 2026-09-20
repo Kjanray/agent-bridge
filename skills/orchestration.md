@@ -5,7 +5,7 @@ Rules for any agent in this repo that delegates through `agent-bridge`. Keep thi
 ## 1. Decide whether to delegate
 
 - Do the work yourself by default. Delegate only self-contained work that needs an independent view (review), is read-heavy (research, exploration), is long-running, or needs a capability you lack.
-- Scale effort to the task. A simple task gets zero delegates. Never fan out by default; run at most 2-3 delegates at once (Codex web allows 5).
+- Scale effort to the task. A simple task gets zero delegates. Never fan out by default. The bridge runs at most two Codex jobs with one queued and rejects excess work.
 - Reads parallelise, writes do not. One writer per set of files. Parallel writers each get `mode="write", worktree=true` and non-overlapping files. Only the orchestrator merges and edits shared files.
 - Architecture and final integration stay with one agent (you) or the human. Worktrees prevent file conflicts, not conflicting decisions.
 
@@ -20,6 +20,12 @@ Rules for any agent in this repo that delegates through `agent-bridge`. Keep thi
 | Gemini | video, audio, very large inputs (`@path/to/file`) | Free-tier quota is small: no research-sized tasks. |
 
 Have a different harness review work than the one that wrote it.
+
+Codex runs through an automated ChatGPT tab (one tab per session, all in one launcher browser), so:
+
+- Keep its threads small. A new task is a new call; reuse `session_id` only to continue the same task. Large pasted context goes in a file, with the path in the brief.
+- `browser stage timed out` means a tab is overloaded. The bridge temporarily rejects new Codex jobs after this class of failure; do not retry around the circuit breaker.
+- `ChatGPT stopped responding` cannot be fixed by Codex's own retries: resend the brief once. If either error repeats, ask the human to restart the Codex Web GPT launcher.
 
 ## 3. Write the brief
 
