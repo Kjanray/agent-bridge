@@ -21,6 +21,8 @@ Rules for any agent in this repo that delegates through `agent-bridge`. Keep thi
 
 Have a different harness review work than the one that wrote it.
 
+Use `mode="auto"` only for a trusted, well-scoped task where the delegate should continue without interactive permission prompts. The bridge maps it to each CLI's native autonomous mode; `list_auto_modes()` reports the exact mapping. Keep `read_only` as the default and prefer ordinary `write` when prompts are acceptable.
+
 Codex runs through an automated ChatGPT tab (one tab per session, all in one launcher browser), so:
 
 - Keep its threads small. A new task is a new call; reuse `session_id` only to continue the same task. Large pasted context goes in a file, with the path in the brief.
@@ -52,7 +54,7 @@ Paste the actual error text, paths and constraints. Ask for a summary of about 3
 
 ## 6. Safety
 
-`read_only` is the default. Pass `mode="write"` only when the task needs edits. Never add sandbox- or approval-bypass flags. Every call is logged to `logs/calls.jsonl` in the bridge repo.
+`read_only` is the default. Pass `mode="write"` when the task needs edits, or `mode="auto"` only when the caller has intentionally authorized autonomous execution. Auto mode must use native bounded/trusted modes; do not add dangerous sandbox-bypass flags. Every call is logged to `logs/calls.jsonl` in the bridge repo.
 
 ## Sources
 

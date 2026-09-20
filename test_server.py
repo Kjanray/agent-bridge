@@ -328,9 +328,20 @@ def test_non_ascii_results_survive_the_stdio_pipe():
 
 def test_tools_list_exposes_the_new_arguments_and_task_tools():
     tools = {t["name"]: t for t in server.TOOLS}
-    assert {"ask_codex", "ask_claude", "ask_kiro", "ask_gemini", "ask_opencode", "check_task", "cancel_task", "list_shared_skills"} <= set(tools)
+    assert {
+        "ask_codex",
+        "ask_claude",
+        "ask_kiro",
+        "ask_gemini",
+        "ask_opencode",
+        "check_task",
+        "cancel_task",
+        "list_shared_skills",
+        "list_auto_modes",
+    } <= set(tools)
     props = tools["ask_codex"]["inputSchema"]["properties"]
     assert {"prompt", "skill", "session_id", "mode", "background", "worktree", "timeout_s"} <= set(props)
+    assert props["mode"]["enum"] == ["read_only", "write", "auto"]
     assert props["background"]["default"] is True
     assert props["background"]["const"] is True
     assert props["prompt"]["maxLength"] == server.CODEX_MAX_PROMPT_CHARS
@@ -347,8 +358,40 @@ def test_codex_command_maps_mode_and_resume():
     assert "features.multi_agent_v2=false" in command
     assert "features.unbounded_connection_retries=false" in command
     assert 'sandbox_mode="workspace-write"' in build("p", "write", None)
+    auto = build("p", "auto", None)
+    assert 'sandbox_mode="workspace-write"' in auto
+    assert 'approval_policy="never"' in auto
+    assert "--approve-for-me" not in auto
     resumed = build("p", "read_only", "abc")
     assert resumed[:3] == ["codex", "exec", "resume"] and "abc" in resumed and resumed[-1] == "-"
+
+
+def test_auto_modes_map_to_native_cli_flags():
+    claude = server.TARGETS["claude"].build("p", "auto", None)
+    assert ["--permission-mode", "auto"] == claude[claude.index("--permission-mode") : claude.index("--permission-mode") + 2]
+    assert ["--permission-prompts", "none"] == claude[
+        claude.index("--permission-prompts") : claude.index("--permission-prompts") + 2
+    ]
+    assert "--dangerously-skip-permissions" not in claude
+
+    kiro = server.TARGETS["kiro"].build("p", "auto", None)
+    assert "--trust-all-tools" in kiro
+    assert not any(arg.startswith("--trust-tools=") for arg in kiro)
+    assert kiro[kiro.index("--agent") + 1] == "worker"
+
+    gemini = server.TARGETS["gemini"].build("p", "auto", None)
+    assert ["--approval-mode", "yolo"] == gemini[gemini.index("--approval-mode") : gemini.index("--approval-mode") + 2]
+
+    opencode = server.TARGETS["opencode"].build("p", "auto", None)
+    assert opencode[opencode.index("--agent") + 1] == "build"
+    assert "--auto" in opencode
+
+
+def test_list_auto_modes_describes_every_delegate():
+    modes = json.loads(server.list_auto_modes())
+    assert set(modes) == {"codex", "claude", "kiro", "gemini", "opencode"}
+    assert modes["codex"]["cli_args"] == ["-c", 'approval_policy="never"']
+    assert modes["kiro"]["cli_args"] == ["--trust-all-tools"]
 
 
 def test_parsers_extract_output_and_session_id():

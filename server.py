@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from auto import AutoController
+
 
 # The bridge is installed once per machine; the project is wherever the harness launched it.
 ROOT = Path(os.environ.get("AGENT_BRIDGE_ROOT") or os.getcwd()).resolve()
@@ -45,7 +47,7 @@ CODEX_REPEAT_COOLDOWN_SECONDS = max(
     CODEX_COOLDOWN_SECONDS,
     float(os.environ.get("AGENT_BRIDGE_CODEX_REPEAT_COOLDOWN_SECONDS", "600")),
 )
-MODES = ("read_only", "write")
+MODES = ("read_only", "write", "auto")
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _LOCK = threading.Lock()
@@ -194,7 +196,7 @@ def _parse_opencode(raw: str) -> tuple[str, str | None]:
 
 
 def _codex(prompt: str, mode: str, session_id: str | None) -> list[str]:
-    sandbox = "workspace-write" if mode == "write" else "read-only"
+    sandbox = "read-only" if mode == "read_only" else "workspace-write"
     resume = ["resume"] if session_id else []
     return [
         "codex",
@@ -210,6 +212,7 @@ def _codex(prompt: str, mode: str, session_id: str | None) -> list[str]:
         "features.multi_agent_v2=false",
         "-c",
         "features.unbounded_connection_retries=false",
+        *(AutoController.args("codex") if mode == "auto" else []),
         "--json",
         *([session_id] if session_id else []),
         "-",
@@ -217,14 +220,20 @@ def _codex(prompt: str, mode: str, session_id: str | None) -> list[str]:
 
 
 def _claude(prompt: str, mode: str, session_id: str | None) -> list[str]:
-    perms = ["--permission-mode", "acceptEdits"] if mode == "write" else ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
+    if mode == "auto":
+        perms = AutoController.args("claude")
+    elif mode == "write":
+        perms = ["--permission-mode", "acceptEdits"]
+    else:
+        perms = ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
     return ["claude", "-p", "--output-format", "json", *perms, *(["--resume", session_id] if session_id else [])]
 
 
 def _kiro(prompt: str, mode: str, session_id: str | None) -> list[str]:
     if session_id:
         raise ValueError("the Kiro worker is stateless: session_id is not supported")
-    tools = "fs_read,fs_write,execute_bash" if mode == "write" else "fs_read"
+    tools = "fs_read,fs_write,execute_bash" if mode != "read_only" else "fs_read"
+    trust = AutoController.args("kiro") if mode == "auto" else [f"--trust-tools={tools}"]
     return [
         "kiro-cli",
         "chat",
@@ -235,19 +244,24 @@ def _kiro(prompt: str, mode: str, session_id: str | None) -> list[str]:
         "never",
         "--agent",
         "worker",
-        f"--trust-tools={tools}",
+        *trust,
         prompt,
     ]
 
 
 def _gemini(prompt: str, mode: str, session_id: str | None) -> list[str]:
-    approval = "auto_edit" if mode == "write" else "plan"
-    return ["gemini", "-o", "json", "--approval-mode", approval, *(["-r", session_id] if session_id else [])]
+    approval = (
+        AutoController.args("gemini")
+        if mode == "auto"
+        else ["--approval-mode", "auto_edit" if mode == "write" else "plan"]
+    )
+    return ["gemini", "-o", "json", *approval, *(["-r", session_id] if session_id else [])]
 
 
 def _opencode(prompt: str, mode: str, session_id: str | None) -> list[str]:
-    agent = "build" if mode == "write" else "plan"
-    return ["opencode", "run", "--format", "json", "--agent", agent, *(["-s", session_id] if session_id else [])]
+    agent = "plan" if mode == "read_only" else "build"
+    auto = AutoController.args("opencode") if mode == "auto" else []
+    return ["opencode", "run", "--format", "json", "--agent", agent, *auto, *(["-s", session_id] if session_id else [])]
 
 
 @dataclass
@@ -462,6 +476,8 @@ def _execute(task: dict[str, Any], prompt: str, skill: str | None, worktree: boo
         )
     if task["mode"] not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
+    if task["mode"] == "auto":
+        AutoController.spec(task["target"])
 
     target = TARGETS[task["target"]]
     full_prompt = _compose_prompt(prompt, skill, target.label)
@@ -622,12 +638,12 @@ def _cancel_active_tasks() -> None:
     """Cancel every in-flight task without blocking on worker cleanup."""
     with _LOCK:
         tasks = list(TASKS.values())
-    for task in tasks:
-        if not task["_thread"].is_alive():
-            continue
-        task["_cancelled"] = True
-        task["status"] = "cancelled"
-        task["output"] = "cancelled by caller"
+        active = [task for task in tasks if task["_thread"].is_alive()]
+        for task in active:
+            task["_cancelled"] = True
+            task["status"] = "cancelled"
+            task["output"] = "cancelled by caller"
+    for task in active:
         if task["_proc"]:
             _kill(task["_proc"])
 
@@ -644,11 +660,22 @@ def list_shared_skills() -> str:
     return "\n".join(names) if names else "No shared skills are defined."
 
 
+def list_auto_modes() -> str:
+    return json.dumps(AutoController.describe(), ensure_ascii=False, indent=2)
+
+
 _ASK_PROPERTIES: dict[str, Any] = {
     "prompt": {"type": "string", "description": "Self-contained task brief: goal, files, constraints, how to verify."},
     "skill": {"type": "string", "description": "Optional shared skill name from .agents, without .md."},
     "session_id": {"type": "string", "description": "Continue an earlier conversation: pass the session_id a previous result returned."},
-    "mode": {"type": "string", "enum": list(MODES), "description": "read_only (default) for review/research; write to let the delegate edit files."},
+    "mode": {
+        "type": "string",
+        "enum": list(MODES),
+        "description": (
+            "read_only (default) for review/research; write for normal editable work; "
+            "auto for trusted autonomous work using the delegate CLI's native no-prompt mode."
+        ),
+    },
     "background": {"type": "boolean", "default": True, "description": "Run detached and return a task_id immediately (default true for MCP calls). Set false only for short calls; foreground execution is capped at 60s."},
     "worktree": {"type": "boolean", "description": "Run in an isolated git worktree on branch bridge/<task_id>. Use for every parallel writer. Only committed files exist there."},
     "timeout_s": {"type": "number", "description": "Override the worker timeout (default 1800s in background; explicit foreground calls are capped at 60s)."},
@@ -698,6 +725,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": "List reusable instruction files available under .agents.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "list_auto_modes",
+        "description": "Show the native CLI permission mode used by mode='auto' for every delegate harness.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
 ]
 
 
@@ -724,6 +756,8 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any] | str:
         return cancel_task(str(arguments.get("task_id", "")))
     if name == "list_shared_skills":
         return list_shared_skills()
+    if name == "list_auto_modes":
+        return list_auto_modes()
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -758,10 +792,11 @@ def _handle(message: dict[str, Any]) -> None:
                 "result": {
                     "protocolVersion": protocol,
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "agent-bridge", "version": "0.3.0"},
+                    "serverInfo": {"name": "agent-bridge", "version": "0.4.0"},
                     "instructions": (
                         "Delegate with ask_<harness>. Read .agents/orchestration.md before delegating. "
-                        "Default mode is read_only; pass mode='write' plus worktree=true for parallel writers. "
+                        "Default mode is read_only; use mode='write' for normal edits or mode='auto' for trusted no-prompt autonomous work. "
+                        "Use worktree=true for parallel writers. "
                         "Pass a returned session_id to continue a conversation. "
                         "background=true returns a task_id for check_task/cancel_task; Codex is always detached. "
                         "Codex prompt size, outstanding work, and browser cooldown are enforced by the server. "

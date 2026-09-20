@@ -1,0 +1,56 @@
+{
+  "name": "trusted-dev",
+  "description": "User-global trusted development agent. Auto-approves routine reads, edits, tests, and safe/read-only shell commands across projects; sensitive files and destructive commands stay gated.",
+  "tools": [
+    "read",
+    "write",
+    "shell",
+    "code",
+    "grep",
+    "glob",
+    "use_aws"
+  ],
+  "allowedTools": [
+    "read",
+    "grep",
+    "glob",
+    "code",
+    "write"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "./**"
+      ],
+      "deniedPaths": [
+        "./.env",
+        "./.env.*",
+        "./**/.env",
+        "./secrets/**",
+        "./**/secrets/**",
+        "./**/*.pem",
+        "./**/*.key",
+        "./**/credentials*",
+        "./**/id_rsa*"
+      ]
+    },
+    "shell": {
+      "autoAllowReadonly": true,
+      "allowedCommands": [
+        "python -m pytest",
+        "python -m pip list",
+        "git status",
+        "git diff",
+        "git log",
+        "git branch",
+        "docker ps",
+        "docker compose ps",
+        "docker start",
+        "docker compose up -d"
+      ]
+    },
+    "use_aws": {
+      "autoAllowReadonly": true
+    }
+  }
+}

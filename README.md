@@ -4,7 +4,7 @@ A stdio MCP server that lets coding-agent CLIs on one machine delegate to each o
 
 - `ask_codex`, `ask_claude`, `ask_kiro`, `ask_gemini`, `ask_opencode`
 - `check_task(task_id, wait_s?)`, `cancel_task(task_id)`
-- `list_shared_skills()`
+- `list_shared_skills()`, `list_auto_modes()`
 
 Every `ask_*` tool takes `prompt` plus optional:
 
@@ -12,7 +12,7 @@ Every `ask_*` tool takes `prompt` plus optional:
 |---|---|
 | `skill` | Prepend a shared instruction file. |
 | `session_id` | Continue an earlier conversation (not Kiro: the worker is stateless). |
-| `mode` | `read_only` (default) or `write`. Mapped to each CLI's own sandbox/approval flags. |
+| `mode` | `read_only` (default), `write`, or `auto`. `auto` is explicit trusted autonomous execution using each CLI's native no-prompt permission mode. |
 | `background` | Defaults to `true` for MCP calls: return a `task_id` at once; collect with `check_task`, stop with `cancel_task`. Codex calls are always detached; other explicit foreground calls are capped at 60s. |
 | `worktree` | Run in `<project>/.worktrees/<task_id>` on branch `bridge/<task_id>`. Kept if the delegate changed files, removed if not. The project must be a git repo; only committed files exist in a worktree. |
 | `timeout_s` | Worker timeout. Defaults to 1800s for MCP/background calls; explicit foreground calls are capped at 60s. |
@@ -24,9 +24,11 @@ Results are JSON: `status` (`ok`, `error`, `timeout`, `cancelled`, `running`), `
 | Path | Purpose |
 |---|---|
 | `server.py` | The server. No third-party dependencies. |
+| `auto/` | Native `mode="auto"` policy registry for Codex, Claude, Kiro, Gemini, and OpenCode. |
 | `skills/` | Shared instruction files. A project's `.agents/<name>.md` overrides the global skill of the same name. `skills/orchestration.md` holds the delegation rules. |
 | `rules.md` | The short block installed into each harness's global instructions file. |
-| `kiro/worker.json` | The Kiro `worker` agent that `ask_kiro` selects. It has no bridge access. |
+| `kiro/worker.json` | The bounded Kiro `worker` agent that `ask_kiro` selects. It has no bridge access. |
+| `kiro/trusted-dev.json` | Optional user-global Kiro profile for interactive autonomous development with sensitive paths/destructive commands still gated. |
 | `logs/calls.jsonl` | Audit log of every call, with the project root (gitignored). |
 | `logs/transcripts/` | Delegate stdout/stderr transcripts. Only a bounded slice is parsed into memory. Old files are removed as completed task state is evicted. |
 | `test_server.py` | `python test_server.py`. Uses a fake CLI; makes no model calls. |
@@ -39,15 +41,19 @@ Replace `<repo>` with the absolute path of this checkout, using forward slashes.
 |---|---|---|
 | Claude Code | `claude mcp add --scope user agent-bridge -- python <repo>/server.py` | `~/.claude/CLAUDE.md` |
 | Codex | `codex mcp add agent-bridge -- python <repo>/server.py`, then in `~/.codex/config.toml` add `tool_timeout_sec = 1800` and `env_vars = ["AGENT_BRIDGE_DEPTH", "AGENT_BRIDGE_ORIGIN"]`. Do not set `required = true`: a bridge failure would then stop Codex from starting. | `~/.codex/AGENTS.md` |
-| Kiro | `mcpServers` entry in `~/.kiro/settings/mcp.json`; copy `kiro/worker.json` to `~/.kiro/agents/` | `~/.kiro/steering/agent-bridge.md` |
+| Kiro | `mcpServers` entry in `~/.kiro/settings/mcp.json`; copy `kiro/worker.json` and optionally `kiro/trusted-dev.json` to `~/.kiro/agents/` | `~/.kiro/steering/agent-bridge.md` |
 | Gemini CLI | `mcpServers` entry in `~/.gemini/settings.json` | `~/.gemini/GEMINI.md` |
 | OpenCode | `mcp` entry (`"type": "local"`) in `~/.config/opencode/opencode.jsonc` | `~/.config/opencode/AGENTS.md` |
 
 Set `GEMINI_API_KEY` as a user environment variable. Gemini CLI reads only the nearest `.env`, so a project `.env` hides `~/.gemini/.env`.
 
+For an interactive Kiro session that should stop asking about routine development actions, use `kiro-cli chat --agent trusted-dev`. The MCP bridge itself keeps using the smaller `worker` profile and applies `--trust-all-tools` only when the caller explicitly chooses `mode="auto"`.
+
 ## Behaviour notes
 
 - MCP `ask_*` calls default to detached execution. Codex is forced into detached execution, and `check_task(wait_s=...)` is hard-capped at 60s, so one MCP request cannot outlive the ChatGPT-web transport. Tasks do not survive a bridge restart.
+- `mode="auto"` is opt-in and removes interactive permission prompts using native harness controls: Codex keeps `workspace-write` but sets `approval_policy="never"`; Claude uses `--permission-mode auto --permission-prompts none`; Kiro trusts all tools exposed by its bounded `worker` profile; Gemini uses `--approval-mode yolo`; OpenCode uses `--auto`. Run `list_auto_modes()` to inspect the effective mapping.
+- Codex auto mode deliberately does not use `--approve-for-me`: that path invokes Codex automatic approval review and can fail when the separate Codex allowance is exhausted even while the Native2 ChatGPT-web model still has capacity.
 - Codex admits at most three outstanding jobs by default: two running and one queued. Extra jobs fail immediately instead of creating more browser tabs. Override with `AGENT_BRIDGE_CODEX_MAX_PARALLEL` (hard-capped at 4) and `AGENT_BRIDGE_CODEX_MAX_OUTSTANDING`.
 - Codex task prompts are capped at 32,768 characters; put large context in a file and pass its path. Known ChatGPT browser failures open a 120-second circuit breaker, increasing to 600 seconds after another failure within ten minutes. Configure these with `AGENT_BRIDGE_CODEX_MAX_PROMPT_CHARS`, `AGENT_BRIDGE_CODEX_FAILURE_WINDOW_SECONDS`, `AGENT_BRIDGE_CODEX_COOLDOWN_SECONDS`, and `AGENT_BRIDGE_CODEX_REPEAT_COOLDOWN_SECONDS`.
 - Delegated Codex calls are pinned to `chatgpt-web/high` so they stay on the Native2 browser route instead of falling through to a native Codex model. Override with `AGENT_BRIDGE_CODEX_MODEL` when another `chatgpt-web/*` route is desired.
