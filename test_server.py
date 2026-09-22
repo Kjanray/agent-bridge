@@ -727,13 +727,13 @@ def test_usage_limit_is_recorded_and_surfaced_at_session_start(monkeypatch):
             "output": '{"error":{"message":"Upstream request failed: Insufficient account funds","statusCode":402}}',
         }
     )
-    assert "opencode" in server._LIMITS
+    assert server._LIMITS["opencode|default"]["kind"] == "out of funds"
     server._LIMITS.clear()
 
     server._record_limit(
         {"target": "kiro", "status": "error", "model": "claude-opus-5", "output": "Error: monthly limit reached"}
     )
-    assert "kiro" in server._LIMITS
+    assert "kiro|claude-opus-5" in server._LIMITS
     note = server._limits_note()
     assert "Kiro worker" in note and "claude-opus-5" in note
 
@@ -741,7 +741,7 @@ def test_usage_limit_is_recorded_and_surfaced_at_session_start(monkeypatch):
     monkeypatch.setattr(server, "_LIMITS", server._load_limits())
     assert "Kiro worker" in server._limits_note()
 
-    server._LIMITS["kiro"]["until"] = time.time() - 1
+    server._LIMITS["kiro|claude-opus-5"]["until"] = time.time() - 1
     assert server._limits_note() == ""
     # An expired note is dropped on load instead of lingering in the file forever.
     server.LIMITS_PATH.write_text(json.dumps(server._LIMITS), encoding="utf-8")
@@ -893,22 +893,22 @@ def test_rate_limit_is_short_and_never_shortens_a_quota_note(monkeypatch):
     monkeypatch.setattr(server, "LIMITS_PATH", TMP / "limits-rate.json")
     monkeypatch.setattr(server, "_LIMITS", {})
     server._record_limit({"target": "gemini", "status": "error", "output": "429 Too Many Requests"})
-    entry = server._LIMITS["gemini"]
+    entry = server._LIMITS["gemini|default"]
     assert entry["kind"] == "rate limited"
     assert entry["until"] - time.time() <= server.RATE_LIMIT_COOLDOWN_SECONDS + 1
 
     server._record_limit({"target": "gemini", "status": "error", "output": "429 RESOURCE_EXHAUSTED: Quota exceeded for metric"})
-    assert server._LIMITS["gemini"]["kind"] == "quota exhausted"
+    assert server._LIMITS["gemini|default"]["kind"] == "quota exhausted"
     server._record_limit({"target": "gemini", "status": "error", "output": "429 Too Many Requests"})
-    assert server._LIMITS["gemini"]["kind"] == "quota exhausted"
+    assert server._LIMITS["gemini|default"]["kind"] == "quota exhausted"
     assert "quota exhausted" in server._limits_note()
 
     # A timeout's output is the delegate's own activity and never marks a harness spent.
     server._record_limit({"target": "kiro", "status": "timeout", "output": "Last activity:\nsaid: checking the quota exceeded path"})
-    assert "kiro" not in server._LIMITS
+    assert not any(k.startswith("kiro|") for k in server._LIMITS)
     # Discussing quotas in code is not a quota failure.
     server._record_limit({"target": "kiro", "status": "error", "output": "failed: see quota.py line 3"})
-    assert "kiro" not in server._LIMITS
+    assert not any(k.startswith("kiro|") for k in server._LIMITS)
 
 
 def test_missing_cli_is_reported_at_session_start():
@@ -945,4 +945,65 @@ def test_limit_reason_is_the_text_around_the_match_not_trailing_headers(monkeypa
     monkeypatch.setattr(server, "_LIMITS", {})
     output = "OpenCode failed: Upstream request failed: Insufficient account funds" + ', "h":"x"' * 100
     server._record_limit({"target": "opencode", "status": "error", "output": output})
-    assert "Insufficient account funds" in server._LIMITS["opencode"]["reason"]
+    assert "Insufficient account funds" in server._LIMITS["opencode|default"]["reason"]
+
+
+def test_limits_are_per_model_not_per_harness(monkeypatch):
+    monkeypatch.setattr(server, "LIMITS_PATH", TMP / "limits-per-model.json")
+    monkeypatch.setattr(server, "_LIMITS", {})
+    spent = '{"error":{"message":"Upstream request failed: Insufficient account funds","statusCode":402}}'
+    server._record_limit({"target": "opencode", "status": "error", "model": "opencode/claude-haiku-4-5", "output": spent})
+    assert list(server._LIMITS) == ["opencode|opencode/claude-haiku-4-5"]
+    note = server._limits_note()
+    assert "model opencode/claude-haiku-4-5: out of funds" in note
+    assert "free models unaffected" in note
+    assert "opencode/big-pickle" not in note
+
+    # An unset Codex model is the pinned web route, metered apart from native Codex models.
+    server._record_limit({"target": "codex", "status": "error", "output": "You've hit your usage limit"})
+    server._record_limit({"target": "codex", "status": "error", "model": "gpt-5.6-sol", "output": "429 Too Many Requests"})
+    assert server._LIMITS[f"codex|{server.CODEX_MODEL}"]["kind"] == "quota exhausted"
+    assert server._LIMITS["codex|gpt-5.6-sol"]["kind"] == "rate limited"
+
+    # A file written before per-model keys still loads, under the model it recorded.
+    server.LIMITS_PATH.write_text(
+        json.dumps({"gemini": {"until": time.time() + 600, "kind": "quota exhausted", "at": "t", "model": "default"}}),
+        encoding="utf-8",
+    )
+    assert list(server._load_limits()) == ["gemini|default"]
+
+
+def test_codex_browser_guards_apply_only_to_web_routes():
+    assert server._is_codex_web("codex", None)
+    assert server._is_codex_web("codex", "chatgpt-web/light")
+    assert not server._is_codex_web("codex", "gpt-5.6-sol")
+    assert not server._is_codex_web("claude", None)
+
+    original = dict(server._CODEX_HEALTH)
+    original_target = server.TARGETS["codex"]
+    server.TARGETS["codex"] = server.Target(
+        "Codex", lambda prompt, opts: [sys.executable, str(FAKE)], server._parse_claude
+    )
+    try:
+        server._CODEX_HEALTH["blocked_until"] = time.monotonic() + 300
+        server._CODEX_HEALTH["reason"] = "browser stage timed out"
+        try:
+            server.delegate("codex", "p")
+            raise AssertionError("web route ignored the open browser circuit")
+        except RuntimeError as exc:
+            assert "browser circuit" in str(exc)
+        native = server.delegate("codex", "p", model="gpt-5.6-sol")
+        assert server.check_task(native["task_id"], wait_s=10)["status"] == "ok"
+
+        # The prompt cap protects the browser tab only.
+        big = "x" * (server.CODEX_MAX_PROMPT_CHARS + 1)
+        server._CODEX_HEALTH["blocked_until"] = 0.0
+        try:
+            server.delegate("codex", big)
+            raise AssertionError("web route accepted an oversized prompt")
+        except RuntimeError as exc:
+            assert "prompt" in str(exc)
+        assert server.check_task(server.delegate("codex", big, model="gpt-5.6-sol")["task_id"], wait_s=10)["status"] == "ok"
+    finally:
+        server._CODEX_HEALTH.update(original)
+        server.TARGETS["codex"] = original_target

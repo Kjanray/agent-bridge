@@ -21,7 +21,7 @@ Rules for any agent in this repo that delegates through `agent-bridge`. Keep thi
 
 Have a different harness review work than the one that wrote it.
 
-Pass `model=` (and `effort=` where the schema offers it) to choose a model inside the delegate's subscription; omit them for that harness's defaults. Each `ask_*` schema lists the values known to work. Spend the expensive model on judgement (review, architecture) and a cheap one on mechanical work; each result's `usage` shows what that choice cost. Set `max_budget_usd` on Claude calls whose size you cannot predict. If the bridge reported a usage limit at session start, route around that harness or drop to a cheaper model on it rather than retrying the same call.
+Pass `model=` (and `effort=` where the schema offers it) to choose a model inside the delegate's subscription; omit them for that harness's defaults. Each `ask_*` schema lists the values known to work. Spend the expensive model on judgement (review, architecture) and a cheap one on mechanical work; each result's `usage` shows what that choice cost. Set `max_budget_usd` on Claude calls whose size you cannot predict. If the bridge reported a usage limit at session start, it names the spent *model*: limits are per model, so switch `model=` (OpenCode's free models, a native Codex model instead of the web route) or harness rather than retrying the spent one.
 
 Use `mode="auto"` only for a trusted, well-scoped task where the delegate should continue without interactive permission prompts. The bridge maps it to each CLI's native autonomous mode; `list_auto_modes()` reports the exact mapping. Keep `read_only` as the default and prefer ordinary `write` when prompts are acceptable.
 

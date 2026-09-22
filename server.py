@@ -496,7 +496,7 @@ class Target:
 
 TARGETS: dict[str, Target] = {
     "codex": Target(
-        "Codex", _codex, _parse_codex, max_parallel=CODEX_MAX_PARALLEL,
+        "Codex", _codex, _parse_codex,
         description=(
             "Delegate a focused task to Codex CLI. Codex calls are always detached, nested Codex agents are disabled, "
             "and browser capacity is enforced by the bridge."
@@ -539,7 +539,9 @@ TARGETS: dict[str, Target] = {
         "OpenCode", _opencode, _parse_opencode,
         description="Delegate a focused task to OpenCode. Use for implementation, review, or a second opinion.",
         models=(
-            "provider/model, e.g. opencode/claude-opus-5, opencode/claude-sonnet-5, opencode/gemini-3.1-pro, "
+            "provider/model. Free (cost 0, own limits): opencode/big-pickle, opencode/mimo-v2.6-flash-free, "
+            "opencode/nemotron-3.5-lightning-free, opencode/nemotron-3-ultra-free, opencode/ling-3.0-flash-fin-free. "
+            "Paid (need account funds): opencode/claude-opus-5, opencode/claude-sonnet-5, opencode/gemini-3.1-pro, "
             "opencode/deepseek-v4-pro. `opencode models` prints every id the current auth exposes."
         ),
         efforts="Provider-specific variant, e.g. minimal, high, max.",
@@ -648,8 +650,19 @@ def _trim_result(text: str) -> tuple[str, bool]:
     return text[:head] + marker + text[-tail:], True
 
 
+def _effective_model(target: str, model: str | None) -> str:
+    """The model a call really runs on: an unset Codex model means the pinned web route, not 'default'."""
+    return model or (CODEX_MODEL if target == "codex" else "default")
+
+
+def _is_codex_web(target: str, model: str | None) -> bool:
+    # Only chatgpt-web/* routes drive the ChatGPT browser tab. Native Codex models (gpt-5.6-sol...)
+    # have their own limits and never touch the tab, so the browser guards below do not apply to them.
+    return target == "codex" and _effective_model(target, model).startswith("chatgpt-web/")
+
+
 def _codex_admission_error_locked(prompt: str) -> str | None:
-    """Return a deterministic rejection reason. Caller must hold _LOCK."""
+    """Browser-tab guards for chatgpt-web/* Codex calls. Caller must hold _LOCK."""
     if len(prompt) > CODEX_MAX_PROMPT_CHARS:
         return (
             f"Codex prompt is {len(prompt):,} characters; the bridge limit is "
@@ -669,7 +682,7 @@ def _codex_admission_error_locked(prompt: str) -> str | None:
     outstanding = sum(
         1
         for task in TASKS.values()
-        if task.get("target") == "codex" and task.get("status") == "running"
+        if _is_codex_web(str(task.get("target")), task.get("model")) and task.get("status") == "running"
     )
     if outstanding >= CODEX_MAX_OUTSTANDING:
         return (
@@ -680,7 +693,7 @@ def _codex_admission_error_locked(prompt: str) -> str | None:
 
 
 def _record_codex_health(task: dict[str, Any]) -> None:
-    if task.get("target") != "codex" or task.get("status") not in ("error", "timeout"):
+    if not _is_codex_web(str(task.get("target")), task.get("model")) or task.get("status") not in ("error", "timeout"):
         return
     match = _CODEX_BROWSER_FAILURE.search(str(task.get("output", "")))
     if not match:
@@ -701,6 +714,12 @@ def _record_codex_health(task: dict[str, Any]) -> None:
 # A usage limit outlives the bridge process (a new MCP session starts a new server), so it is kept on
 # disk and reported in the initialize instructions: the caller learns which harness is spent before it
 # wastes a delegation on it. Advisory only - the bridge never blocks a call on this.
+# Keyed per harness *and* model: every model has its own limits (a paid OpenCode model can be out of
+# funds while its free ones work; Codex web routes and native Codex models are metered separately).
+def _limit_key(target: str, model: str | None) -> str:
+    return f"{target}|{_effective_model(target, model)}"
+
+
 def _load_limits() -> dict[str, dict[str, Any]]:
     try:
         data = json.loads(LIMITS_PATH.read_text(encoding="utf-8"))
@@ -709,14 +728,23 @@ def _load_limits() -> dict[str, dict[str, Any]]:
     if not isinstance(data, dict):
         return {}
     now = time.time()
-    return {
-        target: entry
-        for target, entry in data.items()
-        if target in TARGETS and isinstance(entry, dict) and float(entry.get("until") or 0) > now
-    }
+    limits = {}
+    for key, entry in data.items():
+        if not isinstance(entry, dict) or float(entry.get("until") or 0) <= now:
+            continue
+        if "|" not in key:  # written before per-model keys: rebuild from the model it recorded
+            model = entry.get("model")
+            key = _limit_key(key, None if model in (None, "default") else model)
+        if key.split("|", 1)[0] in TARGETS:
+            limits[key] = entry
+    return limits
 
 
 _LIMITS: dict[str, dict[str, Any]] = _load_limits()
+_OUT_OF_FUNDS = re.compile(
+    r"insufficient (?:funds|balance|account funds|credit|credits)|out of (?:credit|credits)|payment required|\b402\b",
+    re.IGNORECASE,
+)
 
 
 def _record_limit(task: dict[str, Any]) -> None:
@@ -726,21 +754,24 @@ def _record_limit(task: dict[str, Any]) -> None:
     output = str(task.get("output", ""))
     match = _QUOTA_LIMIT.search(output)
     kind, cooldown = "quota exhausted", LIMIT_COOLDOWN_SECONDS
+    if match and _OUT_OF_FUNDS.search(output):
+        kind = "out of funds"
     if not match:
         match = _RATE_LIMIT.search(output)
         kind, cooldown = "rate limited", RATE_LIMIT_COOLDOWN_SECONDS
     if not match:
         return
+    key = _limit_key(task["target"], task.get("model"))
     with _LOCK:
         until = time.time() + cooldown
-        previous = _LIMITS.get(task["target"])
+        previous = _LIMITS.get(key)
         if previous and float(previous.get("until") or 0) > until:
             return  # a short rate limit never shortens a quota note that is still running
-        _LIMITS[task["target"]] = {
+        _LIMITS[key] = {
             "until": until,
             "kind": kind,
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "model": task.get("model") or "default",
+            "model": _effective_model(task["target"], task.get("model")),
             # The text around the match: CLI errors often end in response headers, not the message.
             "reason": output[max(0, match.start() - 150) : match.end() + 150].strip(),
         }
@@ -753,17 +784,22 @@ def _record_limit(task: dict[str, Any]) -> None:
 
 def _limits_note() -> str:
     now = time.time()
-    active = {target: entry for target, entry in _LIMITS.items() if float(entry.get("until") or 0) > now}
+    active = {key: entry for key, entry in _LIMITS.items() if float(entry.get("until") or 0) > now}
     if not active:
         return ""
-    parts = [
-        f"{TARGETS[target].label} ({entry.get('kind', 'limited')} at {entry['at']} on model {entry['model']}; "
-        f"assume unusable for about {max(1, round((float(entry['until']) - now) / 60))} more minutes)"
-        for target, entry in sorted(active.items())
-    ]
+    parts = []
+    for key, entry in sorted(active.items()):
+        target, model = key.split("|", 1)
+        kind = entry.get("kind", "limited")
+        scope = " (other paid models on that account likely too; free models unaffected)" if kind == "out of funds" else ""
+        parts.append(
+            f"{TARGETS[target].label} model {model}: {kind} at {entry['at']}{scope}; "
+            f"assume unusable for about {max(1, round((float(entry['until']) - now) / 60))} more minutes"
+        )
     return (
         " USAGE LIMITS REPORTED RECENTLY: " + "; ".join(parts) + ". "
-        "Prefer another harness, or a cheaper model= on the same one, before retrying these. "
+        "Limits are per model: another model on the same harness may still work, so switch model= "
+        "or harness rather than retrying the spent one. "
         "This is a heuristic read of the last failure, not a quota query."
     )
 
@@ -818,7 +854,12 @@ def _execute(task: dict[str, Any], prompt: str, skill: str | None, worktree: boo
     command[0] = executable
 
     with _LOCK:
-        slot = _SLOTS.setdefault(task["target"], threading.Semaphore(target.max_parallel))
+        # The ChatGPT tab gets its own small pool; native Codex models use the ordinary per-target one.
+        web = _is_codex_web(task["target"], task.get("model"))
+        slot = _SLOTS.setdefault(
+            "codex:web" if web else task["target"],
+            threading.Semaphore(CODEX_MAX_PARALLEL if web else target.max_parallel),
+        )
     with slot:
         if task["_cancelled"]:
             return
@@ -956,7 +997,7 @@ def delegate(
     task["_thread"] = threading.Thread(target=_work, args=(task, prompt, skill, worktree, timeout), daemon=True)
     _evict_finished_tasks()
     with _LOCK:
-        if target == "codex":
+        if _is_codex_web(target, model):
             rejection = _codex_admission_error_locked(prompt)
             if rejection:
                 raise RuntimeError(rejection)
