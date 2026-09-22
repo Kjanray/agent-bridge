@@ -21,7 +21,7 @@ Rules for any agent in this repo that delegates through `agent-bridge`. Keep thi
 
 Have a different harness review work than the one that wrote it.
 
-Pass `model=` to choose a model inside the delegate's subscription; omit it for that harness's default. Each `ask_*` schema lists the names known to work. Spend the expensive model on judgement (review, architecture) and a cheap one on mechanical work. If the bridge reported a usage limit at session start, route around that harness or drop to a cheaper model on it rather than retrying the same call.
+Pass `model=` (and `effort=` where the schema offers it) to choose a model inside the delegate's subscription; omit them for that harness's defaults. Each `ask_*` schema lists the values known to work. Spend the expensive model on judgement (review, architecture) and a cheap one on mechanical work; each result's `usage` shows what that choice cost. Set `max_budget_usd` on Claude calls whose size you cannot predict. If the bridge reported a usage limit at session start, route around that harness or drop to a cheaper model on it rather than retrying the same call.
 
 Use `mode="auto"` only for a trusted, well-scoped task where the delegate should continue without interactive permission prompts. The bridge maps it to each CLI's native autonomous mode; `list_auto_modes()` reports the exact mapping. Keep `read_only` as the default and prefer ordinary `write` when prompts are acceptable.
 
@@ -50,6 +50,7 @@ Paste the actual error text, paths and constraints. Ask for a summary of about 3
 
 - Two failed corrections of the same delegate: stop, rethink the brief or do it yourself.
 - Collect every background task with `check_task` or end it with `cancel_task`. Leave no orphans.
+- While a task runs, read `progress` from `check_task` instead of waiting blind. A growing `idle_s` with no new `recent` lines means it has stalled: cancel it and resume with `session_id` rather than waiting for the timeout. A result that comes back as a timeout still carries its last activity, so resume from that.
 - After merging or rejecting a worktree: `git worktree remove <path>` and `git branch -D bridge/<task_id>`.
 - Stop and ask the human before destructive actions, on ambiguous requirements, and when agents disagree on architecture.
 - The bridge enforces delegation depth 2. Do not work around it.

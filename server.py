@@ -49,9 +49,13 @@ CODEX_REPEAT_COOLDOWN_SECONDS = max(
     float(os.environ.get("AGENT_BRIDGE_CODEX_REPEAT_COOLDOWN_SECONDS", "600")),
 )
 MODES = ("read_only", "write", "auto")
-# ponytail: a flat cooldown, because no CLI reports its reset time in a parseable way. The original
+# ponytail: flat cooldowns, because no CLI reports its reset time in a parseable way. The original
 # failure text is kept with the note, so the caller can read a real reset time when one was printed.
 LIMIT_COOLDOWN_SECONDS = max(60.0, float(os.environ.get("AGENT_BRIDGE_LIMIT_COOLDOWN_SECONDS", "3600")))
+RATE_LIMIT_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("AGENT_BRIDGE_RATE_LIMIT_COOLDOWN_SECONDS", "120")))
+PROGRESS_TAIL_BYTES = 16_384
+# model/effort go into argv and, for Codex effort, into a TOML -c string: keep them to plain tokens.
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._/:@+-]{1,128}")
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _LOCK = threading.Lock()
@@ -65,27 +69,28 @@ _CODEX_HEALTH: dict[str, Any] = {
     "reason": "",
 }
 
-# Quota-shaped failures, kept tight: a false positive tells the caller a healthy harness is spent.
-_USAGE_LIMIT = re.compile(
+# Limit-shaped failures, kept tight: a false positive tells the caller a healthy harness is spent.
+# Quota is checked first: a quota error often also says 429/RESOURCE_EXHAUSTED, a rate limit never
+# says "quota". Quota means hours (plan or credits spent); a rate limit clears in minutes.
+_QUOTA_LIMIT = re.compile(
     "|".join(
         (
-            r"quota (?:exceeded|exhausted)",
-            r"out of (?:credit|credits|quota)",
+            r"quota (?:exceeded|exhausted|reached)",
+            r"exceeded (?:your |the )?(?:current )?quota",
+            r"out of (?:credit|credits)",
             r"insufficient (?:credit|credits|funds|balance|account funds)",
             r"payment required",
-            r"rate[ -]?limit(?:ed|s)? (?:exceeded|reached|hit)?",
+            r"\b402\b",
             r"usage limit",
             r"(?:weekly|daily|monthly|message) limit (?:reached|exceeded)",
             r"limit reached",
-            r"too many requests",
-            r"resource[_ ]exhausted",
-            # 429 too many requests, 402 payment required: both mean "stop sending work here".
-            r"\b(?:429|402)\b",
             r"upgrade (?:your plan )?to continue",
         )
     ),
     re.IGNORECASE,
 )
+# "rate limit", "rate-limited", "rate_limit_error" - not the x-ratelimit-* headers OpenCode dumps into every API error.
+_RATE_LIMIT = re.compile(r"(?<![-\w])rate[ _-]limit|too many requests|\b429\b|resource[_ ]exhausted", re.IGNORECASE)
 
 _CODEX_BROWSER_FAILURE = re.compile(
     "|".join(
@@ -160,7 +165,7 @@ def _load_skill(name: str | None) -> str:
     raise ValueError(f"shared skill not found: {name}")
 
 
-def _compose_prompt(prompt: str, skill: str | None, target: str) -> str:
+def _compose_prompt(prompt: str, skill: str | None, target: str, timeout_s: float | None = None) -> str:
     shared = _load_skill(skill)
     sections = [
         "You are receiving a delegated task from another local agent harness.",
@@ -169,6 +174,11 @@ def _compose_prompt(prompt: str, skill: str | None, target: str) -> str:
         "Do not delegate this task to another harness unless the task explicitly asks for cross-agent consultation.",
         "If you are blocked or the task is ambiguous, reply 'BLOCKED: <what you need>' instead of guessing.",
     ]
+    if timeout_s:
+        sections.append(
+            f"You will be stopped after about {max(1, int(timeout_s // 60))} minutes. If the work will not fit, stop "
+            "early and report what is done, what is left, and the next step: being cut off loses your summary."
+        )
     if shared:
         sections.extend(["", "Shared skill instructions:", shared])
     sections.extend(["", "Delegated task:", prompt])
@@ -199,8 +209,19 @@ def _parse_json(raw: str, text_key: str) -> tuple[str, str | None]:
         return _parse_text(raw)
 
 
+def _claude_result(raw: str) -> dict[str, Any] | None:
+    # stream-json ends with a "result" event carrying the fields --output-format json used to print.
+    return next((e for e in reversed(_json_lines(raw)) if e.get("type") == "result" or "result" in e), None)
+
+
 def _parse_claude(raw: str) -> tuple[str, str | None]:
-    return _parse_json(raw, "result")
+    result = _claude_result(raw)
+    if not result:
+        return _parse_text(raw)
+    text = result.get("result")
+    if text is None:  # error results (e.g. error_max_budget_usd) carry "errors" instead of "result"
+        text = "; ".join(map(str, result.get("errors") or [])) or str(result.get("subtype") or "")
+    return str(text).strip(), result.get("session_id")
 
 
 def _parse_gemini(raw: str) -> tuple[str, str | None]:
@@ -221,7 +242,132 @@ def _parse_opencode(raw: str) -> tuple[str, str | None]:
     return (text.strip(), session) if text else _parse_text(raw)
 
 
-def _codex(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
+# Token/cost accounting, normalised across CLIs: input excludes cache reads, output includes reasoning.
+def _usage(input_tokens: int = 0, cached: int = 0, output: int = 0, cost: float | None = None, models=()) -> dict[str, Any]:
+    return {
+        "input_tokens": int(input_tokens),
+        "cached_tokens": int(cached),
+        "output_tokens": int(output),
+        "cost_usd": round(cost, 6) if cost is not None else None,
+        "models": sorted(models),
+    }
+
+
+def _usage_claude(raw: str) -> dict[str, Any] | None:
+    # modelUsage, not usage: the top-level usage block reads zero on error results.
+    per_model = (_claude_result(raw) or {}).get("modelUsage")
+    if not isinstance(per_model, dict) or not per_model:
+        return None
+    rows = [m for m in per_model.values() if isinstance(m, dict)]
+    return _usage(
+        sum(m.get("inputTokens", 0) + m.get("cacheCreationInputTokens", 0) for m in rows),
+        sum(m.get("cacheReadInputTokens", 0) for m in rows),
+        sum(m.get("outputTokens", 0) for m in rows),
+        sum(m.get("costUSD", 0.0) for m in rows),
+        per_model,
+    )
+
+
+def _usage_codex(raw: str) -> dict[str, Any] | None:
+    turns = [e["usage"] for e in _json_lines(raw) if e.get("type") == "turn.completed" and isinstance(e.get("usage"), dict)]
+    if not turns:
+        return None
+    cached = sum(u.get("cached_input_tokens", 0) for u in turns)
+    return _usage(sum(u.get("input_tokens", 0) for u in turns) - cached, cached, sum(u.get("output_tokens", 0) for u in turns))
+
+
+def _usage_opencode(raw: str) -> dict[str, Any] | None:
+    steps = [e["part"] for e in _json_lines(raw) if e.get("type") == "step_finish" and isinstance(e.get("part"), dict)]
+    tokens = [s.get("tokens") or {} for s in steps]
+    if not tokens:
+        return None
+    return _usage(
+        sum(t.get("input", 0) for t in tokens),
+        sum((t.get("cache") or {}).get("read", 0) for t in tokens),
+        sum(t.get("output", 0) + t.get("reasoning", 0) for t in tokens),
+        sum(float(s.get("cost") or 0) for s in steps),
+    )
+
+
+def _usage_gemini(raw: str) -> dict[str, Any] | None:
+    try:
+        models = json.loads(raw[raw.index("{") :])["stats"]["models"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    tokens = [m.get("tokens") or {} for m in models.values()]
+    return _usage(
+        sum(t.get("input", 0) for t in tokens),
+        sum(t.get("cached", 0) for t in tokens),
+        sum(t.get("candidates", 0) + t.get("thoughts", 0) for t in tokens),
+        models=models,
+    )
+
+
+def _progress_line(event: dict[str, Any]) -> str | None:
+    """One short line per meaningful event from Codex, OpenCode or Claude stream-json; None for bookkeeping."""
+    item = event.get("item") or event.get("part") or {}
+    kind = item.get("type") if isinstance(item, dict) else None
+    if kind in ("agent_message", "text"):
+        return "said: " + str(item.get("text", ""))
+    if kind == "command_execution":
+        return f"ran: {item.get('command', '')} [{item.get('status', '')}]"
+    if kind == "tool":  # OpenCode
+        state = item.get("state") or {}
+        args = state.get("input") or {}
+        detail = state.get("title") or args.get("command") or args.get("filePath") or ""
+        return f"{item.get('tool')}: {detail} [{state.get('status', '')}]"
+    if event.get("type") == "assistant":  # Claude
+        parts = []
+        for block in (event.get("message") or {}).get("content") or []:
+            if block.get("type") == "tool_use":
+                args = block.get("input") or {}
+                parts.append(f"{block.get('name')}: {args.get('description') or args.get('command') or args.get('file_path') or ''}")
+            elif block.get("type") == "text":
+                parts.append("said: " + str(block.get("text", "")))
+        return " | ".join(parts) or None
+    return None
+
+
+def _progress(task: dict[str, Any], lines: int = 8) -> dict[str, Any]:
+    """What a running (or timed-out) delegate did most recently, read from its live transcript."""
+    stdout_path = Path(task.get("transcript") or "")
+    if not stdout_path.is_file():
+        return {"note": "not started yet: waiting for a worker slot"}
+    recent: list[str] = []
+    # Kiro's text mode prints its tool activity on stderr, so fall back to it when stdout says nothing.
+    for path in (stdout_path, Path(task.get("stderr_transcript") or "")):
+        if not path.is_file() or not path.stat().st_size:
+            continue
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - PROGRESS_TAIL_BYTES))
+            raw_lines = _ANSI.sub("", handle.read().decode("utf-8", "replace")).splitlines()
+        if size > PROGRESS_TAIL_BYTES:
+            raw_lines = raw_lines[1:]  # the first line was cut by the seek
+        for raw in raw_lines:
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                event = None
+            line = _progress_line(event) if isinstance(event, dict) else raw.strip()
+            if line:
+                recent.append(line if len(line) <= 200 else line[:197] + "...")
+        if recent:
+            break
+    stderr_path = Path(task.get("stderr_transcript") or "")
+    last_write = max(p.stat().st_mtime for p in (stdout_path, stderr_path) if p.is_file())
+    idle = time.time() - last_write
+    progress: dict[str, Any] = {"recent": recent[-lines:], "idle_s": round(idle)}
+    if not recent:
+        progress["note"] = (
+            "Gemini prints nothing until it finishes" if task.get("target") == "gemini" else "no output yet"
+        )
+    return progress
+
+
+# Builders take the task dict (mode, session_id, model, effort, max_budget_usd) and return argv.
+def _codex(prompt: str, opts: dict[str, Any]) -> list[str]:
+    mode, session_id, effort = opts["mode"], opts.get("session_id"), opts.get("effort")
     sandbox = "read-only" if mode == "read_only" else "workspace-write"
     resume = ["resume"] if session_id else []
     return [
@@ -229,9 +375,10 @@ def _codex(prompt: str, mode: str, session_id: str | None, model: str | None) ->
         "exec",
         *resume,
         "-m",
-        model or CODEX_MODEL,
+        opts.get("model") or CODEX_MODEL,
         "-c",
         f'sandbox_mode="{sandbox}"',
+        *(["-c", f'model_reasoning_effort="{effort}"'] if effort else []),
         "-c",
         "features.multi_agent=false",
         "-c",
@@ -245,7 +392,10 @@ def _codex(prompt: str, mode: str, session_id: str | None, model: str | None) ->
     ]
 
 
-def _claude(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
+def _claude(prompt: str, opts: dict[str, Any]) -> list[str]:
+    mode, session_id, model, effort, budget = (
+        opts["mode"], opts.get("session_id"), opts.get("model"), opts.get("effort"), opts.get("max_budget_usd")
+    )
     if mode == "auto":
         perms = AutoController.args("claude")
     elif mode == "write":
@@ -255,16 +405,22 @@ def _claude(prompt: str, mode: str, session_id: str | None, model: str | None) -
     return [
         "claude",
         "-p",
+        # stream-json (which -p requires --verbose for) writes events as they happen, so check_task
+        # can show progress; the final "result" event is what --output-format json used to print.
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         *perms,
         *(["--model", model] if model else []),
+        *(["--effort", effort] if effort else []),
+        *(["--max-budget-usd", f"{float(budget):g}"] if budget else []),
         *(["--resume", session_id] if session_id else []),
     ]
 
 
-def _kiro(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
-    if session_id:
+def _kiro(prompt: str, opts: dict[str, Any]) -> list[str]:
+    mode, model, effort = opts["mode"], opts.get("model"), opts.get("effort")
+    if opts.get("session_id"):
         raise ValueError("the Kiro worker is stateless: session_id is not supported")
     tools = "fs_read,fs_write,execute_bash" if mode != "read_only" else "fs_read"
     trust = AutoController.args("kiro") if mode == "auto" else [f"--trust-tools={tools}"]
@@ -279,12 +435,16 @@ def _kiro(prompt: str, mode: str, session_id: str | None, model: str | None) -> 
         "--agent",
         "worker",
         *(["--model", model] if model else []),
+        *(["--effort", effort] if effort else []),
         *trust,
         prompt,
     ]
 
 
-def _gemini(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
+def _gemini(prompt: str, opts: dict[str, Any]) -> list[str]:
+    mode, session_id, model = opts["mode"], opts.get("session_id"), opts.get("model")
+    if opts.get("effort"):
+        raise ValueError("Gemini CLI has no effort control: pick a lighter or heavier model= instead")
     approval = (
         AutoController.args("gemini")
         if mode == "auto"
@@ -300,7 +460,8 @@ def _gemini(prompt: str, mode: str, session_id: str | None, model: str | None) -
     ]
 
 
-def _opencode(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
+def _opencode(prompt: str, opts: dict[str, Any]) -> list[str]:
+    mode, session_id, model, effort = opts["mode"], opts.get("session_id"), opts.get("model"), opts.get("effort")
     agent = "plan" if mode == "read_only" else "build"
     auto = AutoController.args("opencode") if mode == "auto" else []
     return [
@@ -312,6 +473,7 @@ def _opencode(prompt: str, mode: str, session_id: str | None, model: str | None)
         agent,
         *auto,
         *(["-m", model] if model else []),
+        *(["--variant", effort] if effort else []),
         *(["-s", session_id] if session_id else []),
     ]
 
@@ -319,15 +481,17 @@ def _opencode(prompt: str, mode: str, session_id: str | None, model: str | None)
 @dataclass
 class Target:
     label: str
-    build: Callable[[str, str, str | None, str | None], list[str]]
+    build: Callable[[str, dict[str, Any]], list[str]]
     parse: Callable[[str], tuple[str, str | None]]
     # gemini and opencode resolve to .CMD shims on Windows, which mangle multi-line args: pipe the prompt.
     stdin: bool = True
     max_parallel: int = 3
     description: str = ""
-    # Free-text passthrough to the CLI's model flag; the hint lists names known to work on
-    # 2026-09-22 and goes stale when a harness adds models. Refresh from the CLI's own list command.
+    # Free-text passthrough to the CLI's model/effort flags; the hints list values known to work on
+    # 2026-09-22 and go stale when a harness adds models. Refresh from the CLI's own list command.
     models: str = ""
+    efforts: str = ""  # empty: the CLI has no effort control, so the schema does not offer it
+    usage: Callable[[str], dict[str, Any] | None] = lambda raw: None
 
 
 TARGETS: dict[str, Target] = {
@@ -342,11 +506,18 @@ TARGETS: dict[str, Target] = {
             "chatgpt-web/high, chatgpt-web/extra-high. Direct models: gpt-5.6-sol, gpt-5.6-luna, gpt-5.6-terra, "
             "gpt-6-astra. Leave unset to keep the web route."
         ),
+        efforts=(
+            "minimal, low, medium, high, xhigh. A chatgpt-web/* route already names its effort "
+            "(light/high/extra-high): change the route instead."
+        ),
+        usage=_usage_codex,
     ),
     "claude": Target(
         "Claude Code", _claude, _parse_claude,
         description="Delegate a focused task to Claude Code. Use for implementation, review, or a second opinion.",
         models="opus, sonnet, haiku, or a full id such as claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5.",
+        efforts="low, medium, high, xhigh, max.",
+        usage=_usage_claude,
     ),
     "kiro": Target(
         "Kiro worker", _kiro, _parse_text, stdin=False,
@@ -356,11 +527,13 @@ TARGETS: dict[str, Target] = {
             "gpt-5.6-terra, gpt-5.6-luna, glm-5, minimax-m2.5, deepseek-3.2, qwen3-coder-next. "
             "Credit multipliers differ per model; `kiro-cli chat --list-models` prints the current table."
         ),
+        efforts="low, medium, high, xhigh, max.",
     ),
     "gemini": Target(
         "Gemini CLI", _gemini, _parse_gemini,
         description="Delegate to Gemini CLI. Use for video/audio or very large inputs; reference files as @path/to/file in the prompt.",
         models="gemini-3-pro, gemini-3-flash, or another id the installed CLI accepts.",
+        usage=_usage_gemini,
     ),
     "opencode": Target(
         "OpenCode", _opencode, _parse_opencode,
@@ -369,6 +542,8 @@ TARGETS: dict[str, Target] = {
             "provider/model, e.g. opencode/claude-opus-5, opencode/claude-sonnet-5, opencode/gemini-3.1-pro, "
             "opencode/deepseek-v4-pro. `opencode models` prints every id the current auth exposes."
         ),
+        efforts="Provider-specific variant, e.g. minimal, high, max.",
+        usage=_usage_opencode,
     ),
 }
 TOOL_TARGETS: dict[str, str] = {f"ask_{name}": name for name in TARGETS}
@@ -545,17 +720,29 @@ _LIMITS: dict[str, dict[str, Any]] = _load_limits()
 
 
 def _record_limit(task: dict[str, Any]) -> None:
-    if task.get("status") not in ("error", "timeout"):
+    # Errors only: a timeout's output is the delegate's own recent activity, which may mention quotas.
+    if task.get("status") != "error":
         return
-    match = _USAGE_LIMIT.search(str(task.get("output", "")))
+    output = str(task.get("output", ""))
+    match = _QUOTA_LIMIT.search(output)
+    kind, cooldown = "quota exhausted", LIMIT_COOLDOWN_SECONDS
+    if not match:
+        match = _RATE_LIMIT.search(output)
+        kind, cooldown = "rate limited", RATE_LIMIT_COOLDOWN_SECONDS
     if not match:
         return
     with _LOCK:
+        until = time.time() + cooldown
+        previous = _LIMITS.get(task["target"])
+        if previous and float(previous.get("until") or 0) > until:
+            return  # a short rate limit never shortens a quota note that is still running
         _LIMITS[task["target"]] = {
-            "until": time.time() + LIMIT_COOLDOWN_SECONDS,
+            "until": until,
+            "kind": kind,
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "model": task.get("model") or "default",
-            "reason": str(task.get("output", "")).strip()[-300:],
+            # The text around the match: CLI errors often end in response headers, not the message.
+            "reason": output[max(0, match.start() - 150) : match.end() + 150].strip(),
         }
         try:
             LIMITS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -570,8 +757,8 @@ def _limits_note() -> str:
     if not active:
         return ""
     parts = [
-        f"{TARGETS[target].label} (hit {entry['at']} on model {entry['model']}; assume unusable for about "
-        f"{max(1, int((float(entry['until']) - now) / 60))} more minutes)"
+        f"{TARGETS[target].label} ({entry.get('kind', 'limited')} at {entry['at']} on model {entry['model']}; "
+        f"assume unusable for about {max(1, round((float(entry['until']) - now) / 60))} more minutes)"
         for target, entry in sorted(active.items())
     ]
     return (
@@ -579,6 +766,18 @@ def _limits_note() -> str:
         "Prefer another harness, or a cheaper model= on the same one, before retrying these. "
         "This is a heuristic read of the last failure, not a quota query."
     )
+
+
+def _missing_clis_note() -> str:
+    missing = []
+    for target in TARGETS.values():
+        try:
+            binary = target.build("", {"mode": "read_only"})[0]
+        except Exception:
+            continue
+        if not shutil.which(binary):
+            missing.append(f"{target.label} ({binary})")
+    return f" NOT INSTALLED, do not delegate to: {', '.join(missing)}." if missing else ""
 
 
 def _evict_finished_tasks() -> None:
@@ -609,8 +808,10 @@ def _execute(task: dict[str, Any], prompt: str, skill: str | None, worktree: boo
         AutoController.spec(task["target"])
 
     target = TARGETS[task["target"]]
-    full_prompt = _compose_prompt(prompt, skill, target.label)
-    command = target.build(full_prompt, task["mode"], task["session_id"], task.get("model"))
+    if task.get("max_budget_usd") and task["target"] != "claude":
+        raise ValueError("max_budget_usd is only enforced by Claude Code (--max-budget-usd); other CLIs have no cap flag")
+    full_prompt = _compose_prompt(prompt, skill, target.label, timeout_s)
+    command = target.build(full_prompt, task)
     executable = shutil.which(command[0])
     if not executable:
         raise RuntimeError(f"{command[0]} is not installed or not on PATH")
@@ -654,8 +855,14 @@ def _execute(task: dict[str, Any], prompt: str, skill: str | None, worktree: boo
                     proc.communicate(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
+                # Keep what the delegate got through: the recent activity is often enough to resume from.
+                recent = _progress(task).get("recent") or []
                 task["status"] = "timeout"
-                task["output"] = f"{target.label} timed out after {timeout_s:g}s"
+                task["output"] = f"{target.label} timed out after {timeout_s:g}s." + (
+                    " Last activity:\n" + "\n".join(recent) if recent else " It produced no output."
+                )
+                stdout, _, _ = _read_bounded(stdout_path)
+                task["usage"] = target.usage(_ANSI.sub("", stdout))
                 return
 
     if task["_cancelled"]:
@@ -663,8 +870,10 @@ def _execute(task: dict[str, Any], prompt: str, skill: str | None, worktree: boo
     stdout, stdout_truncated, stdout_bytes = _read_bounded(stdout_path)
     stderr, stderr_truncated, stderr_bytes = _read_bounded(stderr_path)
     task["transcript_bytes"] = stdout_bytes + stderr_bytes
-    output, session = target.parse(_ANSI.sub("", stdout))
+    clean_stdout = _ANSI.sub("", stdout)
+    output, session = target.parse(clean_stdout)
     task["session_id"] = session or task["session_id"]
+    task["usage"] = target.usage(clean_stdout)  # before the exit check: failed runs cost tokens too
     if proc.returncode != 0:
         detail = output or _ANSI.sub("", stderr).strip() or f"exit code {proc.returncode}"
         raise RuntimeError(f"{target.label} failed: {detail[-6000:]}")
@@ -711,15 +920,25 @@ def delegate(
     worktree: bool = False,
     timeout_s: float | None = None,
     model: str | None = None,
+    effort: str | None = None,
+    max_budget_usd: float | None = None,
 ) -> dict[str, Any]:
     if target == "codex":
         background = True
+    for name, value in (("model", model), ("effort", effort)):
+        if value and not _SAFE_TOKEN.fullmatch(value):
+            raise ValueError(f"{name} must be a plain identifier such as 'high' or 'provider/model-1.5', got {value!r}")
+    if max_budget_usd is not None and float(max_budget_usd) <= 0:
+        raise ValueError("max_budget_usd must be positive")
     task: dict[str, Any] = {
         "task_id": uuid.uuid4().hex[:8],
         "target": target,
         "status": "running",
         "mode": mode,
         "model": model or None,
+        "effort": effort or None,
+        "max_budget_usd": max_budget_usd,
+        "usage": None,
         "session_id": session_id,
         "worktree": None,
         "branch": None,
@@ -748,14 +967,51 @@ def delegate(
     return _public(task)
 
 
+def _task_from_log(task_id: str) -> dict[str, Any] | None:
+    """A finished task from an earlier bridge process, rebuilt from the audit log and its transcript."""
+    try:
+        # ponytail: reads the whole audit log; fine at thousands of calls, rotate the log if it grows past that.
+        lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    entry = None
+    for line in reversed(lines):
+        try:
+            candidate = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("task_id") == task_id:
+            entry = candidate
+            break
+    if not entry:
+        return None
+    result = {k: v for k, v in entry.items() if k not in ("prompt", "output_tail", "root", "depth")}
+    output = entry.get("output_tail", "")
+    target = TARGETS.get(str(entry.get("target")))
+    transcript = Path(entry.get("transcript") or "")
+    if target and entry.get("status") == "ok" and transcript.is_file():
+        stdout, _, _ = _read_bounded(transcript)
+        output = target.parse(_ANSI.sub("", stdout))[0] or output
+    result["output"], result["output_truncated"] = _trim_result(output)
+    result["recovered_from"] = "audit log: this task finished under an earlier bridge process"
+    return result
+
+
 def check_task(task_id: str, wait_s: float = 0) -> dict[str, Any]:
     task = TASKS.get(task_id)
     if not task:
-        return {"task_id": task_id, "status": "error", "output": "unknown task_id (tasks do not survive a bridge restart)"}
+        return _task_from_log(task_id) or {
+            "task_id": task_id,
+            "status": "error",
+            "output": "unknown task_id: not running here and not in the audit log",
+        }
     if task.get("_cancelled"):
         return _public(task)
     task["_thread"].join(timeout=max(0.0, min(float(wait_s), CHECK_TASK_MAX_WAIT_SECONDS)))
-    return _public(task)
+    result = _public(task)
+    if task["_thread"].is_alive():
+        result["progress"] = _progress(task)
+    return result
 
 
 def cancel_task(task_id: str) -> dict[str, Any]:
@@ -854,6 +1110,7 @@ _ASK_PROPERTIES: dict[str, Any] = {
         ),
     },
     "model": {"type": "string", "description": "Model the delegate CLI should run. Omit to use that harness's own default."},
+    "effort": {"type": "string", "description": "Reasoning effort for the model. Omit for the CLI default."},
     "background": {"type": "boolean", "default": True, "description": "Run detached and return a task_id immediately (default true for MCP calls). Set false only for short calls; foreground execution is capped at 60s."},
     "worktree": {"type": "boolean", "description": "Run in an isolated git worktree on branch bridge/<task_id>. Use for every parallel writer. Only committed files exist there."},
     "timeout_s": {"type": "number", "description": "Override the worker timeout (default 1800s in background; explicit foreground calls are capped at 60s)."},
@@ -865,6 +1122,19 @@ def _ask_properties(target: str) -> dict[str, Any]:
     properties = {name: dict(schema) for name, schema in _ASK_PROPERTIES.items()}
     if TARGETS[target].models:
         properties["model"]["description"] += " Known values: " + TARGETS[target].models
+    if TARGETS[target].efforts:
+        properties["effort"]["description"] += " Known values: " + TARGETS[target].efforts
+    else:
+        del properties["effort"]
+    if target == "claude":
+        properties["max_budget_usd"] = {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": (
+                "Stop the run once its computed cost passes this many USD (Claude's own --max-budget-usd). "
+                "Checked between turns, so one turn can overshoot. Works on subscription too."
+            ),
+        }
     if target == "codex":
         properties["prompt"]["maxLength"] = CODEX_MAX_PROMPT_CHARS
         properties["prompt"]["description"] += " Large context must be stored in a file and referenced by path."
@@ -941,6 +1211,8 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any] | str:
             worktree=bool(arguments.get("worktree")),
             timeout_s=timeout_s,
             model=(arguments.get("model") or "").strip() or None,
+            effort=(arguments.get("effort") or "").strip() or None,
+            max_budget_usd=arguments.get("max_budget_usd"),
         )
     if name == "check_task":
         return check_task(str(arguments.get("task_id", "")), arguments.get("wait_s") or 0)
@@ -989,7 +1261,9 @@ def _handle(message: dict[str, Any]) -> None:
                     "serverInfo": {"name": "agent-bridge", "version": "0.4.0"},
                     "instructions": (
                         "Delegate with ask_<harness>. Read .agents/orchestration.md before delegating. "
-                        "Pass model=<name> to pick a model inside that harness's subscription; omit it for the default. "
+                        "Pass model=<name> (and effort=<level> where offered) to pick a model inside that harness's "
+                        "subscription; omit them for the defaults. Results carry token usage, and check_task on a "
+                        "running task returns its recent activity and idle time. "
                         "Default mode is read_only; use mode='write' for normal edits or mode='auto' for trusted no-prompt autonomous work. "
                         "Use worktree=true for parallel writers. "
                         "Pass a returned session_id to continue a conversation. "
@@ -997,6 +1271,7 @@ def _handle(message: dict[str, Any]) -> None:
                         "Codex prompt size, outstanding work, and browser cooldown are enforced by the server. "
                         "Delegation depth is limited to prevent recursive agent loops."
                         + _limits_note()
+                        + _missing_clis_note()
                     ),
                 },
             }

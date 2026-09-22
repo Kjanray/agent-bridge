@@ -21,6 +21,8 @@ FAKE.write_text(
 import json, pathlib, sys, time
 args = sys.argv[1:]
 prompt = sys.stdin.read()
+if "--emit" in args:
+    print(args[args.index("--emit") + 1], flush=True)
 if "--sleep" in args:
     time.sleep(float(args[args.index("--sleep") + 1]))
 if "--write" in args:
@@ -44,19 +46,21 @@ for cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "init"]):
 server.ROOT = REPO
 server.LOG_PATH = TMP / "calls.jsonl"
 server.TRANSCRIPT_DIR = TMP / "transcripts"
+server.LIMITS_PATH = TMP / "limits.json"  # never write the real limits file from a test run
+server._LIMITS = {}
 
 
 def fake(*extra: str, max_parallel: int = 3) -> str:
     name = f"fake{len(server.TARGETS)}"
     server.TARGETS[name] = server.Target(
         label="Fake",
-        build=lambda prompt, mode, session_id, model: [
+        build=lambda prompt, opts: [
             sys.executable,
             str(FAKE),
             *extra,
-            f"--mode={mode}",
-            *([f"--model={model}"] if model else []),
-            *(["--resume", session_id] if session_id else []),
+            f"--mode={opts['mode']}",
+            *([f"--model={opts['model']}"] if opts.get("model") else []),
+            *(["--resume", opts["session_id"]] if opts.get("session_id") else []),
         ],
         parse=server._parse_claude,
         stdin=True,
@@ -352,38 +356,38 @@ def test_tools_list_exposes_the_new_arguments_and_task_tools():
 
 def test_codex_command_maps_mode_and_resume():
     build = server.TARGETS["codex"].build
-    command = build("p", "read_only", None, None)
+    command = build("p", {"mode": "read_only"})
     assert 'sandbox_mode="read-only"' in command
     assert command[command.index("-m") + 1] == server.CODEX_MODEL == "chatgpt-web/high"
     assert "features.multi_agent=false" in command
     assert "features.multi_agent_v2=false" in command
     assert "features.unbounded_connection_retries=false" in command
-    assert 'sandbox_mode="workspace-write"' in build("p", "write", None, None)
-    auto = build("p", "auto", None, None)
+    assert 'sandbox_mode="workspace-write"' in build("p", {"mode": "write"})
+    auto = build("p", {"mode": "auto"})
     assert 'sandbox_mode="workspace-write"' in auto
     assert 'approval_policy="never"' in auto
     assert "--approve-for-me" not in auto
-    resumed = build("p", "read_only", "abc", None)
+    resumed = build("p", {"mode": "read_only", "session_id": "abc"})
     assert resumed[:3] == ["codex", "exec", "resume"] and "abc" in resumed and resumed[-1] == "-"
 
 
 def test_auto_modes_map_to_native_cli_flags():
-    claude = server.TARGETS["claude"].build("p", "auto", None, None)
+    claude = server.TARGETS["claude"].build("p", {"mode": "auto"})
     assert ["--permission-mode", "auto"] == claude[claude.index("--permission-mode") : claude.index("--permission-mode") + 2]
     assert ["--permission-prompts", "none"] == claude[
         claude.index("--permission-prompts") : claude.index("--permission-prompts") + 2
     ]
     assert "--dangerously-skip-permissions" not in claude
 
-    kiro = server.TARGETS["kiro"].build("p", "auto", None, None)
+    kiro = server.TARGETS["kiro"].build("p", {"mode": "auto"})
     assert "--trust-all-tools" in kiro
     assert not any(arg.startswith("--trust-tools=") for arg in kiro)
     assert kiro[kiro.index("--agent") + 1] == "worker"
 
-    gemini = server.TARGETS["gemini"].build("p", "auto", None, None)
+    gemini = server.TARGETS["gemini"].build("p", {"mode": "auto"})
     assert ["--approval-mode", "yolo"] == gemini[gemini.index("--approval-mode") : gemini.index("--approval-mode") + 2]
 
-    opencode = server.TARGETS["opencode"].build("p", "auto", None, None)
+    opencode = server.TARGETS["opencode"].build("p", {"mode": "auto"})
     assert opencode[opencode.index("--agent") + 1] == "build"
     assert "--auto" in opencode
 
@@ -481,7 +485,7 @@ def test_codex_call_is_forced_into_background():
     original_health = dict(server._CODEX_HEALTH)
     server.TARGETS["codex"] = server.Target(
         label="Fake Codex",
-        build=lambda prompt, mode, session_id, model: [sys.executable, str(FAKE), "--sleep", "1"],
+        build=lambda prompt, opts: [sys.executable, str(FAKE), "--sleep", "1"],
         parse=server._parse_claude,
         max_parallel=1,
     )
@@ -526,7 +530,7 @@ def test_codex_outstanding_capacity_is_enforced_atomically():
     original_health = dict(server._CODEX_HEALTH)
     server.TARGETS["codex"] = server.Target(
         label="Fake Codex",
-        build=lambda prompt, mode, session_id, model: [sys.executable, str(FAKE), "--sleep", "30"],
+        build=lambda prompt, opts: [sys.executable, str(FAKE), "--sleep", "30"],
         parse=server._parse_claude,
         max_parallel=1,
     )
@@ -682,13 +686,13 @@ def test_model_reaches_every_cli_and_defaults_stay_put():
         "opencode": ("-m", "opencode/claude-sonnet-5"),
     }
     for name, (flag, model) in expected.items():
-        command = server.TARGETS[name].build("p", "read_only", None, model)
+        command = server.TARGETS[name].build("p", {"mode": "read_only", "model": model})
         assert command[command.index(flag) + 1] == model, name
-        default = server.TARGETS[name].build("p", "read_only", None, None)
+        default = server.TARGETS[name].build("p", {"mode": "read_only"})
         # Only Codex pins a default model; the rest fall through to the CLI's own choice.
         assert (flag in default) is (name == "codex"), name
-    assert server.TARGETS["codex"].build("p", "read_only", None, None)[
-        server.TARGETS["codex"].build("p", "read_only", None, None).index("-m") + 1
+    assert server.TARGETS["codex"].build("p", {"mode": "read_only"})[
+        server.TARGETS["codex"].build("p", {"mode": "read_only"}).index("-m") + 1
     ] == server.CODEX_MODEL
 
 
@@ -742,3 +746,203 @@ def test_usage_limit_is_recorded_and_surfaced_at_session_start(monkeypatch):
     # An expired note is dropped on load instead of lingering in the file forever.
     server.LIMITS_PATH.write_text(json.dumps(server._LIMITS), encoding="utf-8")
     assert server._load_limits() == {}
+
+
+def test_effort_reaches_each_cli_and_is_refused_where_unsupported():
+    def build(name, **opts):
+        return server.TARGETS[name].build("p", {"mode": "read_only", **opts})
+
+    assert 'model_reasoning_effort="xhigh"' in build("codex", effort="xhigh")
+    claude = build("claude", effort="max")
+    assert claude[claude.index("--effort") + 1] == "max"
+    kiro = build("kiro", effort="low")
+    assert kiro[kiro.index("--effort") + 1] == "low"
+    opencode = build("opencode", effort="high")
+    assert opencode[opencode.index("--variant") + 1] == "high"
+    for name in ("codex", "claude", "kiro", "opencode"):
+        assert all("effort" not in arg and arg != "--variant" for arg in build(name)), name
+    try:
+        build("gemini", effort="high")
+        raise AssertionError("gemini accepted an effort it cannot apply")
+    except ValueError as exc:
+        assert "model=" in str(exc)
+    assert "effort" not in server._ask_properties("gemini")
+    assert "xhigh" in server._ask_properties("codex")["effort"]["description"]
+
+    # Codex effort is spliced into a TOML string: anything but a plain token is rejected up front.
+    for bad in ('high" sandbox_mode="danger', "a b"):
+        try:
+            server.delegate("codex", "p", effort=bad)
+            raise AssertionError(f"accepted {bad!r}")
+        except ValueError:
+            pass
+
+
+def test_budget_cap_is_claude_only():
+    claude = server.TARGETS["claude"].build("p", {"mode": "read_only", "max_budget_usd": 0.5})
+    assert claude[claude.index("--max-budget-usd") + 1] == "0.5"
+    assert "max_budget_usd" in server._ask_properties("claude")
+    assert all("max_budget_usd" not in server._ask_properties(n) for n in ("codex", "kiro", "gemini", "opencode"))
+    result = server.delegate(fake(), "x", max_budget_usd=1.0)
+    assert result["status"] == "error" and "only enforced by Claude" in result["output"]
+
+
+def test_claude_stream_json_is_parsed_including_error_results():
+    stream = "\n".join(
+        json.dumps(e)
+        for e in (
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}},
+            {
+                "type": "result",
+                "result": "8141b94",
+                "session_id": "c-9",
+                "modelUsage": {
+                    "claude-haiku-4-5": {
+                        "inputTokens": 10,
+                        "cacheCreationInputTokens": 90,
+                        "cacheReadInputTokens": 500,
+                        "outputTokens": 40,
+                        "costUSD": 0.07,
+                    }
+                },
+            },
+        )
+    )
+    assert server._parse_claude(stream) == ("8141b94", "c-9")
+    assert server._usage_claude(stream) == {
+        "input_tokens": 100,
+        "cached_tokens": 500,
+        "output_tokens": 40,
+        "cost_usd": 0.07,
+        "models": ["claude-haiku-4-5"],
+    }
+    # The exact shape a real --max-budget-usd stop returned.
+    capped = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_max_budget_usd",
+            "is_error": True,
+            "errors": ["Reached maximum budget ($0.0001)"],
+            "session_id": "c-10",
+        }
+    )
+    assert server._parse_claude(capped) == ("Reached maximum budget ($0.0001)", "c-10")
+    assert server._progress_line(json.loads(stream.splitlines()[1])) == "Bash: ls"
+
+
+def test_usage_is_normalised_from_each_cli_format():
+    codex = "\n".join(
+        json.dumps(e)
+        for e in (
+            {"type": "thread.started", "thread_id": "t"},
+            {"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 50}},
+            {"type": "turn.completed", "usage": {"input_tokens": 500, "cached_input_tokens": 100, "output_tokens": 25}},
+        )
+    )
+    assert server._usage_codex(codex) == {
+        "input_tokens": 1000, "cached_tokens": 500, "output_tokens": 75, "cost_usd": None, "models": [],
+    }
+    opencode = "\n".join(
+        json.dumps(e)
+        for e in (
+            {"type": "step_finish", "part": {"tokens": {"input": 100, "output": 10, "reasoning": 5, "cache": {"read": 900}}, "cost": 0.01}},
+            {"type": "step_finish", "part": {"tokens": {"input": 20, "output": 1, "reasoning": 0, "cache": {"read": 80}}, "cost": 0.02}},
+        )
+    )
+    assert server._usage_opencode(opencode) == {
+        "input_tokens": 120, "cached_tokens": 980, "output_tokens": 16, "cost_usd": 0.03, "models": [],
+    }
+    gemini = json.dumps(
+        {
+            "response": "PONG",
+            "stats": {"models": {"gemini-3.5-flash": {"tokens": {"input": 16378, "cached": 12175, "candidates": 45, "thoughts": 618}}}},
+        },
+        indent=2,
+    )
+    assert server._usage_gemini(gemini) == {
+        "input_tokens": 16378, "cached_tokens": 12175, "output_tokens": 663, "cost_usd": None, "models": ["gemini-3.5-flash"],
+    }
+    assert server._usage_codex("plain text") is None and server._usage_gemini("plain text") is None
+
+
+def test_running_task_reports_progress_and_a_timeout_keeps_it():
+    event = {"type": "item.started", "item": {"type": "command_execution", "command": "pytest -q", "status": "in_progress"}}
+    name = fake("--emit", json.dumps(event), "--sleep", "30")
+    task = server.delegate(name, "x", background=True, timeout_s=4)
+    deadline = time.time() + 3
+    snapshot = server.check_task(task["task_id"])
+    while not snapshot.get("progress", {}).get("recent") and time.time() < deadline:
+        snapshot = server.check_task(task["task_id"], wait_s=0.2)
+    assert snapshot["status"] == "running"
+    assert snapshot["progress"]["recent"] == ["ran: pytest -q [in_progress]"]
+    assert snapshot["progress"]["idle_s"] >= 0
+
+    final = server.check_task(task["task_id"], wait_s=10)
+    assert final["status"] == "timeout"
+    assert "Last activity:\nran: pytest -q [in_progress]" in final["output"]
+    assert "progress" not in final
+
+
+def test_delegate_is_told_its_deadline():
+    assert "stopped after about 5 minutes" in server._compose_prompt("do it", None, "Fake", 300)
+    assert "stopped after" not in server._compose_prompt("do it", None, "Fake")
+
+
+def test_rate_limit_is_short_and_never_shortens_a_quota_note(monkeypatch):
+    monkeypatch.setattr(server, "LIMITS_PATH", TMP / "limits-rate.json")
+    monkeypatch.setattr(server, "_LIMITS", {})
+    server._record_limit({"target": "gemini", "status": "error", "output": "429 Too Many Requests"})
+    entry = server._LIMITS["gemini"]
+    assert entry["kind"] == "rate limited"
+    assert entry["until"] - time.time() <= server.RATE_LIMIT_COOLDOWN_SECONDS + 1
+
+    server._record_limit({"target": "gemini", "status": "error", "output": "429 RESOURCE_EXHAUSTED: Quota exceeded for metric"})
+    assert server._LIMITS["gemini"]["kind"] == "quota exhausted"
+    server._record_limit({"target": "gemini", "status": "error", "output": "429 Too Many Requests"})
+    assert server._LIMITS["gemini"]["kind"] == "quota exhausted"
+    assert "quota exhausted" in server._limits_note()
+
+    # A timeout's output is the delegate's own activity and never marks a harness spent.
+    server._record_limit({"target": "kiro", "status": "timeout", "output": "Last activity:\nsaid: checking the quota exceeded path"})
+    assert "kiro" not in server._LIMITS
+    # Discussing quotas in code is not a quota failure.
+    server._record_limit({"target": "kiro", "status": "error", "output": "failed: see quota.py line 3"})
+    assert "kiro" not in server._LIMITS
+
+
+def test_missing_cli_is_reported_at_session_start():
+    name = f"fake{len(server.TARGETS)}"
+    server.TARGETS[name] = server.Target(
+        label="Ghost", build=lambda prompt, opts: ["definitely-not-an-installed-cli-7f3a"], parse=server._parse_text
+    )
+    try:
+        assert "Ghost (definitely-not-an-installed-cli-7f3a)" in server._missing_clis_note()
+    finally:
+        del server.TARGETS[name]
+
+
+def test_finished_task_is_recovered_after_a_bridge_restart():
+    done = server.delegate(fake(), "remember me")
+    assert done["status"] == "ok"
+    server.TASKS.pop(done["task_id"])  # what a new bridge process sees
+    recovered = server.check_task(done["task_id"])
+    assert recovered["status"] == "ok"
+    assert "remember me" in recovered["output"]  # re-parsed from the transcript, not the 500-char log tail
+    assert recovered["recovered_from"].startswith("audit log")
+    assert "prompt" not in recovered
+    assert server.check_task("nosuchid")["status"] == "error"
+
+
+def test_rate_limit_headers_alone_are_not_a_rate_limit():
+    headers = 'failed: 400 bad model {"x-ratelimit-remaining":"99","x-ratelimit-limit":"100"}'
+    assert not server._RATE_LIMIT.search(headers)
+    assert server._RATE_LIMIT.search('{"type":"rate_limit_error"}')
+    assert server._RATE_LIMIT.search("Rate-limited, retry in 20s")
+
+
+def test_limit_reason_is_the_text_around_the_match_not_trailing_headers(monkeypatch):
+    monkeypatch.setattr(server, "_LIMITS", {})
+    output = "OpenCode failed: Upstream request failed: Insufficient account funds" + ', "h":"x"' * 100
+    server._record_limit({"target": "opencode", "status": "error", "output": output})
+    assert "Insufficient account funds" in server._LIMITS["opencode"]["reason"]
