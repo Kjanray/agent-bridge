@@ -50,11 +50,12 @@ def fake(*extra: str, max_parallel: int = 3) -> str:
     name = f"fake{len(server.TARGETS)}"
     server.TARGETS[name] = server.Target(
         label="Fake",
-        build=lambda prompt, mode, session_id: [
+        build=lambda prompt, mode, session_id, model: [
             sys.executable,
             str(FAKE),
             *extra,
             f"--mode={mode}",
+            *([f"--model={model}"] if model else []),
             *(["--resume", session_id] if session_id else []),
         ],
         parse=server._parse_claude,
@@ -351,38 +352,38 @@ def test_tools_list_exposes_the_new_arguments_and_task_tools():
 
 def test_codex_command_maps_mode_and_resume():
     build = server.TARGETS["codex"].build
-    command = build("p", "read_only", None)
+    command = build("p", "read_only", None, None)
     assert 'sandbox_mode="read-only"' in command
     assert command[command.index("-m") + 1] == server.CODEX_MODEL == "chatgpt-web/high"
     assert "features.multi_agent=false" in command
     assert "features.multi_agent_v2=false" in command
     assert "features.unbounded_connection_retries=false" in command
-    assert 'sandbox_mode="workspace-write"' in build("p", "write", None)
-    auto = build("p", "auto", None)
+    assert 'sandbox_mode="workspace-write"' in build("p", "write", None, None)
+    auto = build("p", "auto", None, None)
     assert 'sandbox_mode="workspace-write"' in auto
     assert 'approval_policy="never"' in auto
     assert "--approve-for-me" not in auto
-    resumed = build("p", "read_only", "abc")
+    resumed = build("p", "read_only", "abc", None)
     assert resumed[:3] == ["codex", "exec", "resume"] and "abc" in resumed and resumed[-1] == "-"
 
 
 def test_auto_modes_map_to_native_cli_flags():
-    claude = server.TARGETS["claude"].build("p", "auto", None)
+    claude = server.TARGETS["claude"].build("p", "auto", None, None)
     assert ["--permission-mode", "auto"] == claude[claude.index("--permission-mode") : claude.index("--permission-mode") + 2]
     assert ["--permission-prompts", "none"] == claude[
         claude.index("--permission-prompts") : claude.index("--permission-prompts") + 2
     ]
     assert "--dangerously-skip-permissions" not in claude
 
-    kiro = server.TARGETS["kiro"].build("p", "auto", None)
+    kiro = server.TARGETS["kiro"].build("p", "auto", None, None)
     assert "--trust-all-tools" in kiro
     assert not any(arg.startswith("--trust-tools=") for arg in kiro)
     assert kiro[kiro.index("--agent") + 1] == "worker"
 
-    gemini = server.TARGETS["gemini"].build("p", "auto", None)
+    gemini = server.TARGETS["gemini"].build("p", "auto", None, None)
     assert ["--approval-mode", "yolo"] == gemini[gemini.index("--approval-mode") : gemini.index("--approval-mode") + 2]
 
-    opencode = server.TARGETS["opencode"].build("p", "auto", None)
+    opencode = server.TARGETS["opencode"].build("p", "auto", None, None)
     assert opencode[opencode.index("--agent") + 1] == "build"
     assert "--auto" in opencode
 
@@ -480,7 +481,7 @@ def test_codex_call_is_forced_into_background():
     original_health = dict(server._CODEX_HEALTH)
     server.TARGETS["codex"] = server.Target(
         label="Fake Codex",
-        build=lambda prompt, mode, session_id: [sys.executable, str(FAKE), "--sleep", "1"],
+        build=lambda prompt, mode, session_id, model: [sys.executable, str(FAKE), "--sleep", "1"],
         parse=server._parse_claude,
         max_parallel=1,
     )
@@ -525,7 +526,7 @@ def test_codex_outstanding_capacity_is_enforced_atomically():
     original_health = dict(server._CODEX_HEALTH)
     server.TARGETS["codex"] = server.Target(
         label="Fake Codex",
-        build=lambda prompt, mode, session_id: [sys.executable, str(FAKE), "--sleep", "30"],
+        build=lambda prompt, mode, session_id, model: [sys.executable, str(FAKE), "--sleep", "30"],
         parse=server._parse_claude,
         max_parallel=1,
     )
@@ -572,6 +573,92 @@ def test_codex_browser_failure_opens_circuit():
         server._CODEX_HEALTH.update(original_health)
 
 
+def test_kill_wmi_is_registered_as_a_no_argument_tool():
+    tools = {t["name"]: t for t in server.TOOLS}
+    assert "kill_wmi" in tools
+    assert tools["kill_wmi"]["inputSchema"]["properties"] == {}
+    assert tools["kill_wmi"]["inputSchema"]["additionalProperties"] is False
+
+
+def test_kill_wmi_reports_how_many_provider_hosts_it_terminated():
+    original = subprocess.run
+    calls = {}
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = 'SUCCESS: The process "WmiPrvSE.exe" with PID 111 has been terminated.\n' \
+                 'SUCCESS: The process "WmiPrvSE.exe" with PID 222 has been terminated.\n'
+        stderr = ""
+
+    def fake_run(cmd, *args, **kwargs):
+        calls["cmd"] = cmd
+        return FakeCompleted()
+
+    server.os.name = "nt"
+    subprocess.run = fake_run
+    try:
+        result = server.kill_wmi()
+    finally:
+        subprocess.run = original
+    assert calls["cmd"] == ["taskkill", "/F", "/T", "/IM", "WmiPrvSE.exe"]
+    assert result["status"] == "ok" and result["killed"] == 2
+
+
+def test_kill_wmi_treats_no_running_processes_as_success():
+    original = subprocess.run
+
+    class FakeCompleted:
+        returncode = 128
+        stdout = ""
+        stderr = 'ERROR: The process "WmiPrvSE.exe" not found.\n'
+
+    server.os.name = "nt"
+    subprocess.run = lambda *a, **k: FakeCompleted()
+    try:
+        result = server.kill_wmi()
+    finally:
+        subprocess.run = original
+    assert result["status"] == "ok" and result["killed"] == 0
+
+
+def test_kill_wmi_routes_through_call_tool():
+    original = subprocess.run
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = 'SUCCESS: The process "WmiPrvSE.exe" with PID 111 has been terminated.\n'
+        stderr = ""
+
+    server.os.name = "nt"
+    subprocess.run = lambda *a, **k: FakeCompleted()
+    try:
+        result = server._call_tool("kill_wmi", {})
+    finally:
+        subprocess.run = original
+    assert result["status"] == "ok" and result["killed"] == 1
+
+
+def test_kill_wmi_reports_access_denied_as_needs_elevation():
+    original = subprocess.run
+
+    class FakeCompleted:
+        returncode = 1
+        stdout = ""
+        stderr = (
+            "ERROR: The process with PID 8184 (child process of PID 1296) could not be terminated.\n"
+            "Reason: Access is denied.\n"
+        )
+
+    server.os.name = "nt"
+    subprocess.run = lambda *a, **k: FakeCompleted()
+    try:
+        result = server.kill_wmi()
+    finally:
+        subprocess.run = original
+    assert result["status"] == "error" and result["killed"] == 0
+    assert "administrator" in result["output"].lower()
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
@@ -584,3 +671,74 @@ if __name__ == "__main__":
                 print(f"FAIL {name}\n{traceback.format_exc()}")
     print(f"\n{failed} failed")
     sys.exit(1 if failed else 0)
+
+
+def test_model_reaches_every_cli_and_defaults_stay_put():
+    expected = {
+        "codex": ("-m", "gpt-5.6-sol"),
+        "claude": ("--model", "claude-opus-5"),
+        "kiro": ("--model", "gpt-5.6-luna"),
+        "gemini": ("-m", "gemini-3-flash"),
+        "opencode": ("-m", "opencode/claude-sonnet-5"),
+    }
+    for name, (flag, model) in expected.items():
+        command = server.TARGETS[name].build("p", "read_only", None, model)
+        assert command[command.index(flag) + 1] == model, name
+        default = server.TARGETS[name].build("p", "read_only", None, None)
+        # Only Codex pins a default model; the rest fall through to the CLI's own choice.
+        assert (flag in default) is (name == "codex"), name
+    assert server.TARGETS["codex"].build("p", "read_only", None, None)[
+        server.TARGETS["codex"].build("p", "read_only", None, None).index("-m") + 1
+    ] == server.CODEX_MODEL
+
+
+def test_model_is_advertised_and_forwarded_by_the_tool_call(monkeypatch):
+    for name in ("codex", "claude", "kiro", "gemini", "opencode"):
+        description = server._ask_properties(name)["model"]["description"]
+        assert "Known values:" in description, name
+    assert "chatgpt-web/high" in server._ask_properties("codex")["model"]["description"]
+    assert "provider/model" in server._ask_properties("opencode")["model"]["description"]
+
+    seen = {}
+    monkeypatch.setattr(server, "delegate", lambda target, prompt, **kwargs: seen.update(kwargs) or {"status": "ok"})
+    server._call_tool("ask_kiro", {"prompt": "p", "model": "  claude-opus-5  "})
+    assert seen["model"] == "claude-opus-5"
+    server._call_tool("ask_kiro", {"prompt": "p", "model": "   "})
+    assert seen["model"] is None
+
+
+def test_usage_limit_is_recorded_and_surfaced_at_session_start(monkeypatch):
+    monkeypatch.setattr(server, "LIMITS_PATH", TMP / "limits.json")
+    monkeypatch.setattr(server, "_LIMITS", {})
+    server._record_limit({"target": "kiro", "status": "ok", "output": "quota exceeded"})
+    assert not server._LIMITS  # A successful run never marks a harness spent.
+    server._record_limit({"target": "kiro", "status": "error", "output": "compile error: limit of 3 args"})
+    assert not server._LIMITS  # "limit" alone is not a quota failure.
+
+    # Taken from a real OpenCode reply: the shape a spent account actually arrives in.
+    server._record_limit(
+        {
+            "target": "opencode",
+            "status": "error",
+            "output": '{"error":{"message":"Upstream request failed: Insufficient account funds","statusCode":402}}',
+        }
+    )
+    assert "opencode" in server._LIMITS
+    server._LIMITS.clear()
+
+    server._record_limit(
+        {"target": "kiro", "status": "error", "model": "claude-opus-5", "output": "Error: monthly limit reached"}
+    )
+    assert "kiro" in server._LIMITS
+    note = server._limits_note()
+    assert "Kiro worker" in note and "claude-opus-5" in note
+
+    # The note survives a bridge restart, which is when the caller actually reads it.
+    monkeypatch.setattr(server, "_LIMITS", server._load_limits())
+    assert "Kiro worker" in server._limits_note()
+
+    server._LIMITS["kiro"]["until"] = time.time() - 1
+    assert server._limits_note() == ""
+    # An expired note is dropped on load instead of lingering in the file forever.
+    server.LIMITS_PATH.write_text(json.dumps(server._LIMITS), encoding="utf-8")
+    assert server._load_limits() == {}

@@ -21,6 +21,8 @@ Rules for any agent in this repo that delegates through `agent-bridge`. Keep thi
 
 Have a different harness review work than the one that wrote it.
 
+Pass `model=` to choose a model inside the delegate's subscription; omit it for that harness's default. Each `ask_*` schema lists the names known to work. Spend the expensive model on judgement (review, architecture) and a cheap one on mechanical work. If the bridge reported a usage limit at session start, route around that harness or drop to a cheaper model on it rather than retrying the same call.
+
 Use `mode="auto"` only for a trusted, well-scoped task where the delegate should continue without interactive permission prompts. The bridge maps it to each CLI's native autonomous mode; `list_auto_modes()` reports the exact mapping. Keep `read_only` as the default and prefer ordinary `write` when prompts are acceptable.
 
 Codex runs through an automated ChatGPT tab (one tab per session, all in one launcher browser), so:

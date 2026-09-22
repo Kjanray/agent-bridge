@@ -22,6 +22,7 @@ from auto import AutoController
 ROOT = Path(os.environ.get("AGENT_BRIDGE_ROOT") or os.getcwd()).resolve()
 GLOBAL_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 LOG_PATH = Path(__file__).resolve().parent / "logs" / "calls.jsonl"
+LIMITS_PATH = Path(__file__).resolve().parent / "logs" / "limits.json"
 TRANSCRIPT_DIR = Path(__file__).resolve().parent / "logs" / "transcripts"
 MAX_DEPTH = int(os.environ.get("AGENT_BRIDGE_MAX_DEPTH", "2"))
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AGENT_BRIDGE_TIMEOUT_SECONDS", "600"))
@@ -48,6 +49,9 @@ CODEX_REPEAT_COOLDOWN_SECONDS = max(
     float(os.environ.get("AGENT_BRIDGE_CODEX_REPEAT_COOLDOWN_SECONDS", "600")),
 )
 MODES = ("read_only", "write", "auto")
+# ponytail: a flat cooldown, because no CLI reports its reset time in a parseable way. The original
+# failure text is kept with the note, so the caller can read a real reset time when one was printed.
+LIMIT_COOLDOWN_SECONDS = max(60.0, float(os.environ.get("AGENT_BRIDGE_LIMIT_COOLDOWN_SECONDS", "3600")))
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _LOCK = threading.Lock()
@@ -60,6 +64,28 @@ _CODEX_HEALTH: dict[str, Any] = {
     "blocked_until": 0.0,
     "reason": "",
 }
+
+# Quota-shaped failures, kept tight: a false positive tells the caller a healthy harness is spent.
+_USAGE_LIMIT = re.compile(
+    "|".join(
+        (
+            r"quota (?:exceeded|exhausted)",
+            r"out of (?:credit|credits|quota)",
+            r"insufficient (?:credit|credits|funds|balance|account funds)",
+            r"payment required",
+            r"rate[ -]?limit(?:ed|s)? (?:exceeded|reached|hit)?",
+            r"usage limit",
+            r"(?:weekly|daily|monthly|message) limit (?:reached|exceeded)",
+            r"limit reached",
+            r"too many requests",
+            r"resource[_ ]exhausted",
+            # 429 too many requests, 402 payment required: both mean "stop sending work here".
+            r"\b(?:429|402)\b",
+            r"upgrade (?:your plan )?to continue",
+        )
+    ),
+    re.IGNORECASE,
+)
 
 _CODEX_BROWSER_FAILURE = re.compile(
     "|".join(
@@ -195,7 +221,7 @@ def _parse_opencode(raw: str) -> tuple[str, str | None]:
     return (text.strip(), session) if text else _parse_text(raw)
 
 
-def _codex(prompt: str, mode: str, session_id: str | None) -> list[str]:
+def _codex(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
     sandbox = "read-only" if mode == "read_only" else "workspace-write"
     resume = ["resume"] if session_id else []
     return [
@@ -203,7 +229,7 @@ def _codex(prompt: str, mode: str, session_id: str | None) -> list[str]:
         "exec",
         *resume,
         "-m",
-        CODEX_MODEL,
+        model or CODEX_MODEL,
         "-c",
         f'sandbox_mode="{sandbox}"',
         "-c",
@@ -219,17 +245,25 @@ def _codex(prompt: str, mode: str, session_id: str | None) -> list[str]:
     ]
 
 
-def _claude(prompt: str, mode: str, session_id: str | None) -> list[str]:
+def _claude(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
     if mode == "auto":
         perms = AutoController.args("claude")
     elif mode == "write":
         perms = ["--permission-mode", "acceptEdits"]
     else:
         perms = ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
-    return ["claude", "-p", "--output-format", "json", *perms, *(["--resume", session_id] if session_id else [])]
+    return [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        *perms,
+        *(["--model", model] if model else []),
+        *(["--resume", session_id] if session_id else []),
+    ]
 
 
-def _kiro(prompt: str, mode: str, session_id: str | None) -> list[str]:
+def _kiro(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
     if session_id:
         raise ValueError("the Kiro worker is stateless: session_id is not supported")
     tools = "fs_read,fs_write,execute_bash" if mode != "read_only" else "fs_read"
@@ -244,35 +278,56 @@ def _kiro(prompt: str, mode: str, session_id: str | None) -> list[str]:
         "never",
         "--agent",
         "worker",
+        *(["--model", model] if model else []),
         *trust,
         prompt,
     ]
 
 
-def _gemini(prompt: str, mode: str, session_id: str | None) -> list[str]:
+def _gemini(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
     approval = (
         AutoController.args("gemini")
         if mode == "auto"
         else ["--approval-mode", "auto_edit" if mode == "write" else "plan"]
     )
-    return ["gemini", "-o", "json", *approval, *(["-r", session_id] if session_id else [])]
+    return [
+        "gemini",
+        "-o",
+        "json",
+        *approval,
+        *(["-m", model] if model else []),
+        *(["-r", session_id] if session_id else []),
+    ]
 
 
-def _opencode(prompt: str, mode: str, session_id: str | None) -> list[str]:
+def _opencode(prompt: str, mode: str, session_id: str | None, model: str | None) -> list[str]:
     agent = "plan" if mode == "read_only" else "build"
     auto = AutoController.args("opencode") if mode == "auto" else []
-    return ["opencode", "run", "--format", "json", "--agent", agent, *auto, *(["-s", session_id] if session_id else [])]
+    return [
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--agent",
+        agent,
+        *auto,
+        *(["-m", model] if model else []),
+        *(["-s", session_id] if session_id else []),
+    ]
 
 
 @dataclass
 class Target:
     label: str
-    build: Callable[[str, str, str | None], list[str]]
+    build: Callable[[str, str, str | None, str | None], list[str]]
     parse: Callable[[str], tuple[str, str | None]]
     # gemini and opencode resolve to .CMD shims on Windows, which mangle multi-line args: pipe the prompt.
     stdin: bool = True
     max_parallel: int = 3
     description: str = ""
+    # Free-text passthrough to the CLI's model flag; the hint lists names known to work on
+    # 2026-09-22 and goes stale when a harness adds models. Refresh from the CLI's own list command.
+    models: str = ""
 
 
 TARGETS: dict[str, Target] = {
@@ -282,22 +337,38 @@ TARGETS: dict[str, Target] = {
             "Delegate a focused task to Codex CLI. Codex calls are always detached, nested Codex agents are disabled, "
             "and browser capacity is enforced by the bridge."
         ),
+        models=(
+            f"default {CODEX_MODEL}. ChatGPT-web routes (subscription, no API billing): chatgpt-web/light, "
+            "chatgpt-web/high, chatgpt-web/extra-high. Direct models: gpt-5.6-sol, gpt-5.6-luna, gpt-5.6-terra, "
+            "gpt-6-astra. Leave unset to keep the web route."
+        ),
     ),
     "claude": Target(
         "Claude Code", _claude, _parse_claude,
         description="Delegate a focused task to Claude Code. Use for implementation, review, or a second opinion.",
+        models="opus, sonnet, haiku, or a full id such as claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5.",
     ),
     "kiro": Target(
         "Kiro worker", _kiro, _parse_text, stdin=False,
         description="Delegate a bounded implementation task to the local Kiro worker (pass mode='write'). Stateless: no session_id. Kiro has no bridge tools.",
+        models=(
+            "auto (default, cheapest), claude-opus-5, claude-sonnet-5, claude-haiku-4.5, gpt-5.6-sol, "
+            "gpt-5.6-terra, gpt-5.6-luna, glm-5, minimax-m2.5, deepseek-3.2, qwen3-coder-next. "
+            "Credit multipliers differ per model; `kiro-cli chat --list-models` prints the current table."
+        ),
     ),
     "gemini": Target(
         "Gemini CLI", _gemini, _parse_gemini,
         description="Delegate to Gemini CLI. Use for video/audio or very large inputs; reference files as @path/to/file in the prompt.",
+        models="gemini-3-pro, gemini-3-flash, or another id the installed CLI accepts.",
     ),
     "opencode": Target(
         "OpenCode", _opencode, _parse_opencode,
         description="Delegate a focused task to OpenCode. Use for implementation, review, or a second opinion.",
+        models=(
+            "provider/model, e.g. opencode/claude-opus-5, opencode/claude-sonnet-5, opencode/gemini-3.1-pro, "
+            "opencode/deepseek-v4-pro. `opencode models` prints every id the current auth exposes."
+        ),
     ),
 }
 TOOL_TARGETS: dict[str, str] = {f"ask_{name}": name for name in TARGETS}
@@ -452,6 +523,64 @@ def _record_codex_health(task: dict[str, Any]) -> None:
         _CODEX_HEALTH["reason"] = match.group(0)
 
 
+# A usage limit outlives the bridge process (a new MCP session starts a new server), so it is kept on
+# disk and reported in the initialize instructions: the caller learns which harness is spent before it
+# wastes a delegation on it. Advisory only - the bridge never blocks a call on this.
+def _load_limits() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(LIMITS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    now = time.time()
+    return {
+        target: entry
+        for target, entry in data.items()
+        if target in TARGETS and isinstance(entry, dict) and float(entry.get("until") or 0) > now
+    }
+
+
+_LIMITS: dict[str, dict[str, Any]] = _load_limits()
+
+
+def _record_limit(task: dict[str, Any]) -> None:
+    if task.get("status") not in ("error", "timeout"):
+        return
+    match = _USAGE_LIMIT.search(str(task.get("output", "")))
+    if not match:
+        return
+    with _LOCK:
+        _LIMITS[task["target"]] = {
+            "until": time.time() + LIMIT_COOLDOWN_SECONDS,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "model": task.get("model") or "default",
+            "reason": str(task.get("output", "")).strip()[-300:],
+        }
+        try:
+            LIMITS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LIMITS_PATH.write_text(json.dumps(_LIMITS, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass  # A lost note is not worth failing the delegation that produced it.
+
+
+def _limits_note() -> str:
+    now = time.time()
+    active = {target: entry for target, entry in _LIMITS.items() if float(entry.get("until") or 0) > now}
+    if not active:
+        return ""
+    parts = [
+        f"{TARGETS[target].label} (hit {entry['at']} on model {entry['model']}; assume unusable for about "
+        f"{max(1, int((float(entry['until']) - now) / 60))} more minutes)"
+        for target, entry in sorted(active.items())
+    ]
+    return (
+        " USAGE LIMITS REPORTED RECENTLY: " + "; ".join(parts) + ". "
+        "Prefer another harness, or a cheaper model= on the same one, before retrying these. "
+        "This is a heuristic read of the last failure, not a quota query."
+    )
+
+
 def _evict_finished_tasks() -> None:
     with _LOCK:
         if len(TASKS) < MAX_RETAINED_TASKS:
@@ -481,7 +610,7 @@ def _execute(task: dict[str, Any], prompt: str, skill: str | None, worktree: boo
 
     target = TARGETS[task["target"]]
     full_prompt = _compose_prompt(prompt, skill, target.label)
-    command = target.build(full_prompt, task["mode"], task["session_id"])
+    command = target.build(full_prompt, task["mode"], task["session_id"], task.get("model"))
     executable = shutil.which(command[0])
     if not executable:
         raise RuntimeError(f"{command[0]} is not installed or not on PATH")
@@ -568,6 +697,7 @@ def _work(task: dict[str, Any], prompt: str, skill: str | None, worktree: bool, 
         )
     task["duration_s"] = round(time.monotonic() - started, 1)
     _record_codex_health(task)
+    _record_limit(task)
     _log(task, prompt)
 
 
@@ -580,6 +710,7 @@ def delegate(
     background: bool = False,
     worktree: bool = False,
     timeout_s: float | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     if target == "codex":
         background = True
@@ -588,6 +719,7 @@ def delegate(
         "target": target,
         "status": "running",
         "mode": mode,
+        "model": model or None,
         "session_id": session_id,
         "worktree": None,
         "branch": None,
@@ -667,6 +799,48 @@ def list_auto_modes() -> str:
     return json.dumps(AutoController.describe(), ensure_ascii=False, indent=2)
 
 
+# The WMI Provider Host (WmiPrvSE.exe) periodically pegs the CPU during long delegate runs and
+# stalls the whole box. It is safe to kill: the WMI service (Winmgmt) respawns provider hosts on
+# demand, so this frees CPU without touching the service itself.
+WMI_PROVIDER_IMAGE = "WmiPrvSE.exe"
+
+
+def kill_wmi() -> dict[str, Any]:
+    if os.name != "nt":
+        return {"status": "error", "killed": 0, "output": "kill_wmi is only supported on Windows"}
+    # /F force, /T whole tree, /IM by image name: kills every provider host at once.
+    done = subprocess.run(
+        ["taskkill", "/F", "/T", "/IM", WMI_PROVIDER_IMAGE],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    output = (done.stdout + done.stderr).strip()
+    lowered = output.lower()
+    killed = output.upper().count("SUCCESS")
+
+    # taskkill exits 128 with "not found" when nothing was running: that is a success for us.
+    if killed == 0 and ("not found" in lowered or "no running" in lowered):
+        return {"status": "ok", "killed": 0, "output": f"no {WMI_PROVIDER_IMAGE} processes were running"}
+
+    # WmiPrvSE runs under a system account, so an unelevated taskkill is denied. Say so plainly:
+    # rerun the harness/terminal as administrator to let it reap the provider hosts.
+    if "access is denied" in lowered:
+        denied = lowered.count("access is denied")
+        detail = (
+            f"terminated {killed} but could not kill {denied} {WMI_PROVIDER_IMAGE} process(es): access is denied. "
+            "WmiPrvSE runs as a system account; run this MCP/terminal as administrator to kill it."
+        )
+        return {"status": "error", "killed": killed, "output": detail}
+
+    if done.returncode != 0 and killed == 0:
+        return {"status": "error", "killed": 0, "output": output or f"taskkill exit code {done.returncode}"}
+    return {"status": "ok", "killed": killed, "output": f"terminated {killed} {WMI_PROVIDER_IMAGE} process(es); Windows will respawn them on demand"}
+
+
 _ASK_PROPERTIES: dict[str, Any] = {
     "prompt": {"type": "string", "description": "Self-contained task brief: goal, files, constraints, how to verify."},
     "skill": {"type": "string", "description": "Optional shared skill name from .agents, without .md."},
@@ -679,6 +853,7 @@ _ASK_PROPERTIES: dict[str, Any] = {
             "auto for trusted autonomous work using the delegate CLI's native no-prompt mode."
         ),
     },
+    "model": {"type": "string", "description": "Model the delegate CLI should run. Omit to use that harness's own default."},
     "background": {"type": "boolean", "default": True, "description": "Run detached and return a task_id immediately (default true for MCP calls). Set false only for short calls; foreground execution is capped at 60s."},
     "worktree": {"type": "boolean", "description": "Run in an isolated git worktree on branch bridge/<task_id>. Use for every parallel writer. Only committed files exist there."},
     "timeout_s": {"type": "number", "description": "Override the worker timeout (default 1800s in background; explicit foreground calls are capped at 60s)."},
@@ -688,6 +863,8 @@ _TASK_ID = {"task_id": {"type": "string", "description": "task_id returned by an
 
 def _ask_properties(target: str) -> dict[str, Any]:
     properties = {name: dict(schema) for name, schema in _ASK_PROPERTIES.items()}
+    if TARGETS[target].models:
+        properties["model"]["description"] += " Known values: " + TARGETS[target].models
     if target == "codex":
         properties["prompt"]["maxLength"] = CODEX_MAX_PROMPT_CHARS
         properties["prompt"]["description"] += " Large context must be stored in a file and referenced by path."
@@ -733,6 +910,17 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Show the native CLI permission mode used by mode='auto' for every delegate harness.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "kill_wmi",
+        "description": (
+            "Kill the Windows WMI Provider Host (WmiPrvSE.exe) processes that periodically peg the CPU and hang "
+            "long-running delegate tasks. Safe and reversible: Windows respawns provider hosts on demand and the "
+            "core WMI service (Winmgmt) is left untouched. Requires the MCP/terminal to run as administrator "
+            "(WmiPrvSE runs as a system account); returns status='error' with an elevation hint otherwise. "
+            "No-op on non-Windows hosts."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
 ]
 
 
@@ -752,6 +940,7 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any] | str:
             background=background,
             worktree=bool(arguments.get("worktree")),
             timeout_s=timeout_s,
+            model=(arguments.get("model") or "").strip() or None,
         )
     if name == "check_task":
         return check_task(str(arguments.get("task_id", "")), arguments.get("wait_s") or 0)
@@ -761,6 +950,8 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any] | str:
         return list_shared_skills()
     if name == "list_auto_modes":
         return list_auto_modes()
+    if name == "kill_wmi":
+        return kill_wmi()
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -798,12 +989,14 @@ def _handle(message: dict[str, Any]) -> None:
                     "serverInfo": {"name": "agent-bridge", "version": "0.4.0"},
                     "instructions": (
                         "Delegate with ask_<harness>. Read .agents/orchestration.md before delegating. "
+                        "Pass model=<name> to pick a model inside that harness's subscription; omit it for the default. "
                         "Default mode is read_only; use mode='write' for normal edits or mode='auto' for trusted no-prompt autonomous work. "
                         "Use worktree=true for parallel writers. "
                         "Pass a returned session_id to continue a conversation. "
                         "background=true returns a task_id for check_task/cancel_task; Codex is always detached. "
                         "Codex prompt size, outstanding work, and browser cooldown are enforced by the server. "
                         "Delegation depth is limited to prevent recursive agent loops."
+                        + _limits_note()
                     ),
                 },
             }

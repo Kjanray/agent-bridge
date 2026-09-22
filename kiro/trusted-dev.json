@@ -1,6 +1,6 @@
 {
   "name": "trusted-dev",
-  "description": "User-global trusted development agent. Auto-approves routine reads, edits, tests, and safe/read-only shell commands across projects; sensitive files and destructive commands stay gated.",
+  "description": "User-global trusted development agent. Auto-approves routine reads, edits, tests, safe/read-only shell commands, and agent-bridge delegation across projects; sensitive files and destructive commands stay gated.",
   "tools": [
     "read",
     "write",
@@ -8,14 +8,16 @@
     "code",
     "grep",
     "glob",
-    "use_aws"
+    "use_aws",
+    "@agent-bridge"
   ],
   "allowedTools": [
     "read",
     "grep",
     "glob",
     "code",
-    "write"
+    "write",
+    "@agent-bridge"
   ],
   "toolsSettings": {
     "write": {
