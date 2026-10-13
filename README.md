@@ -52,6 +52,19 @@ Set `GEMINI_API_KEY` as a user environment variable. Gemini CLI reads only the n
 
 For an interactive Kiro session that should stop asking about routine development actions, use `kiro-cli chat --agent trusted-dev`. That profile lists `@agent-bridge` in both `tools` and `allowedTools`, which is what stops Kiro re-asking for permission on every `ask_*` delegation: an MCP server reached through `includeMcpJson` is loaded but not trusted, so without the entry each bridge call prompts again. The MCP bridge itself keeps using the smaller `worker` profile and applies `--trust-all-tools` only when the caller explicitly chooses `mode="auto"`.
 
+### Auto mode as the startup default for interactive sessions
+
+`mode="auto"` only affects delegated calls. To have the CLIs you launch yourself start without permission prompts, set each one's default. Back up each file first: these settings apply in every folder you start the CLI from.
+
+| CLI | Setting | Effect |
+|---|---|---|
+| Codex | In `~/.codex/config.toml`, top level: `approval_policy = "never"` and `sandbox_mode = "workspace-write"` | Same as the bridge's Codex auto mode. The file is shared with the Codex desktop app. Anything the sandbox blocks (paths outside the workspace, such as `~/.config/git/ignore`) fails instead of asking. |
+| Kiro | `kiro-cli agent set-default trusted-dev` | Routine reads, edits, tests, read-only shell and `@agent-bridge` calls are approved; `.env`/secret paths and destructive commands still ask. Use `kiro-cli chat --trust-all-tools` for no prompts at all. Revert with `kiro-cli agent set-default kiro_default`. |
+| OpenCode | In `~/.config/opencode/opencode.jsonc`: `"permission": { "edit": "allow", "bash": "allow", "webfetch": "allow" }` | Config equivalent of `opencode --auto`. |
+| Antigravity CLI (`agy`) | In `~/.gemini/antigravity-cli/settings.json`: `"toolPermission": "always-proceed"` | Auto-approves tool confirmations. Other values: `request-review`, `strict`, `proceed-in-sandbox`. `agy` is not an `ask_*` target; this is for interactive use only. |
+
+Effect on delegated calls: Codex calls still set `sandbox_mode` per call, so `read_only` stays read-only. Kiro calls still pass `--agent worker` and their own `--trust-tools`, so the default agent is not used. OpenCode `write` calls run the `build` agent, which now inherits the global `allow`, so they behave like `mode="auto"`; `read_only` calls still use the `plan` agent.
+
 ## Behaviour notes
 
 - MCP `ask_*` calls default to detached execution. Codex is forced into detached execution, and `check_task(wait_s=...)` is hard-capped at 60s, so one MCP request cannot outlive the ChatGPT-web transport. Running tasks do not survive a bridge restart. A finished one does: `check_task` on an unknown id falls back to `logs/calls.jsonl` and re-parses the saved transcript for the full output and `session_id`.
